@@ -95,7 +95,7 @@ def load_contract(path, cwd):
     data, identity = snapshot(path, MAX_SETTINGS_BYTES)
     value = json.loads(data)
     expected = {'schema', 'objective', 'acceptance', 'read_paths', 'write_paths', 'commands'}
-    optional = {'read_pins', 'dependencies', 'checks'}
+    optional = {'read_pins', 'dependencies', 'checks', 'deliverables'}
     if not isinstance(value, dict) or not expected <= set(value) or set(value) - expected - optional or value['schema'] not in ('DEEPSEEK_TASK_V1', 'DEEPSEEK_TASK_V2'):
         raise ValueError('Invalid task contract schema/keys')
     if value['schema'] == 'DEEPSEEK_TASK_V1' and set(value) != expected:
@@ -150,6 +150,20 @@ def load_contract(path, cwd):
         if not isinstance(dependency, str) or not within(resolve(dependency, cwd), value['read_paths'], cwd) or not resolve(dependency, cwd).is_file():
             raise ValueError('Missing/unreadable contract dependency: ' + str(dependency))
     check_ids = set()
+    deliverables = value.get('deliverables', [])
+    if not isinstance(deliverables, list) or len(deliverables) > 32:
+        raise ValueError('deliverables must be a list of at most 32 files')
+    delivered_paths = set()
+    for item in deliverables:
+        if (not isinstance(item, dict) or set(item) != {'path', 'must_change'}
+                or not isinstance(item['path'], str) or not item['path']
+                or item['path'].endswith('/') or type(item['must_change']) is not bool
+                or not within(resolve(item['path'], cwd), value['write_paths'], cwd)):
+            raise ValueError('Deliverable needs a file path inside write_paths and boolean must_change')
+        path_key = str(resolve(item['path'], cwd))
+        if path_key in delivered_paths or Path(path_key).is_dir():
+            raise ValueError('Duplicate deliverable or directory instead of file')
+        delivered_paths.add(path_key)
     for check in value.get('checks', []):
         if not isinstance(check, dict) or set(check) not in ({'id', 'path', 'pointer', 'expected'}, {'id', 'path', 'pointer', 'expected_file_sha256'}) or not all(isinstance(check[k], str) and check[k] for k in ('id', 'path')) or not isinstance(check['pointer'], str) or not within(resolve(check['path'], cwd), value['read_paths'], cwd):
             raise ValueError('Invalid acceptance check')
@@ -172,12 +186,17 @@ def check_access(name, args, cwd, contract):
         raise ValueError('Contract mode exposes only approved command IDs, not arbitrary shell')
     if name == 'run_command':
         return
+    if name == 'clone_file':
+        check_access('read_file', {'path': args.get('source_path')}, cwd, contract)
+        check_access('write_file', {'path': args.get('path')}, cwd, contract)
+        return
     key = 'write_paths' if name in ('write_file', 'edit_file') else 'read_paths'
     path = resolve(args.get('path') or '.', cwd)
     def allowed(key):
         return any(path == Path(root) or (directory and path.is_relative_to(root)) for root, directory in contract['scopes'][key])
     if not allowed(key):
-        raise ValueError(f'{name} path outside explicit {key}: {path}')
+        raise ValueError(f'{name} path outside explicit {key}: {path}. '
+                         'Use the exact paths in the contract; a permitted file does not authorize its parent directory.')
     if name == 'edit_file' and not allowed('read_paths'):
         raise ValueError('edit_file also requires read access')
     for source in value.get('read_pins', []):

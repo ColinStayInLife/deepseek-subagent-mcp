@@ -20,7 +20,7 @@ def canonical(path, cwd):
 
 
 def build_contract(draft, cwd):
-    allowed = {'objective', 'acceptance', 'read_paths', 'write_paths', 'commands', 'pinned_read_paths', 'dependencies', 'checks'}
+    allowed = {'objective', 'acceptance', 'read_paths', 'write_paths', 'commands', 'pinned_read_paths', 'dependencies', 'checks', 'deliverables'}
     if not isinstance(draft, dict) or set(draft) - allowed:
         raise ValueError('Unknown draft key')
     value = {'schema':'DEEPSEEK_TASK_V2', 'objective':draft['objective'], 'acceptance':draft['acceptance'],
@@ -29,6 +29,8 @@ def build_contract(draft, cwd):
              'commands':[], 'read_pins':[project.pin(project.resolve(x,cwd)) for x in draft.get('pinned_read_paths',[])],
              'dependencies':[canonical(x,cwd) for x in draft.get('dependencies',[])],
              'checks':[{**x,'path':canonical(x['path'],cwd)} for x in draft.get('checks',[])]}
+    if 'deliverables' in draft:
+        value['deliverables'] = [{**x, 'path': canonical(x['path'], cwd)} for x in draft['deliverables']]
     for entry in draft.get('commands',[]):
         command = dict(entry)
         command['cwd'] = str(project.resolve(command.get('cwd',cwd),cwd))

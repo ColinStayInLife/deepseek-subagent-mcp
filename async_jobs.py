@@ -274,6 +274,14 @@ def snapshot(root, args):
                        job_path=str(job_path(root, task_id)), controller_acceptance_required=True)
         result_meta = (job.get('result') or {}).get('structuredContent', {})
         summary.update(report_path=result_meta.get('report_path'), host_request=result_meta.get('host_request'))
+        # Report counters from the durable checkpoint, never model reasoning,
+        # prompts, or tool result text. Reading status never starts a model.
+        receipt_path = journal.get('receipt_path')
+        if receipt_path:
+            receipt = state.read(receipt_path, {})
+            summary['execution'] = {k: receipt[k] for k in (
+                'server_version', 'steps', 'tool_calls', 'input_tokens', 'output_tokens',
+                'reasoning_tokens', 'usage_complete', 'progress', 'duplicate_read_chars_avoided') if k in receipt}
         if args.get('batch_id') and summary['result']:
             summary['result'] = {k: v for k, v in summary['result'].items() if k != 'content'}
         summaries.append(summary)

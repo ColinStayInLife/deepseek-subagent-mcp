@@ -114,17 +114,18 @@ class ProjectTests(unittest.TestCase):
         self.assertIn('json_query', names)
         self.assertIn('retain original geometry', captured[0]['instructions'])
 
-    def test_early_budget_report_preserves_evidence_without_more_tools(self):
+    def test_predicted_budget_stop_preserves_evidence_without_paid_report(self):
         (self.root / 'input.json').write_text('{"error":"known failure"}')
-        replies = [response(calls=[('json_query', {'path': 'input.json', 'pointers': ['/error']})]), response('Evidence read; implementation remains')]
+        replies = [response(calls=[('json_query', {'path': 'input.json', 'pointers': ['/error']})])]
+        replies[0]['usage']['input_tokens'] = 1200
         captured = []
         def fake(payload, timeout):
             captured.append(copy.deepcopy(payload)); return replies.pop(0)
         with patch.object(s, 'call_responses', side_effect=fake):
             report, stats = s.run_subagent('inspect', '', self.cwd, 'deepseek-flash', 'max', 20, False, False, 30,
                                          input_budget=2000, record_dir=self.root / 'run')
-        self.assertEqual(stats['status'], 'input_budget_report')
-        self.assertEqual(captured[-1]['tool_choice'], 'none')
+        self.assertEqual(stats['status'], 'input_budget_prediction')
+        self.assertEqual(len(captured), 1)
         receipt = json.loads((self.root / 'run/receipt.json').read_text())
         self.assertEqual(receipt['action_records'][0]['status'], 'returned')
         evidence = receipt['action_records'][0]['result_file']

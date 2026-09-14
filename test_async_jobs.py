@@ -35,6 +35,11 @@ def fixture_worker(root, task_id):
                 return response(calls=[('request_host', {'capability': 'read', 'arguments': {'query': 'evidence'}, 'reason': 'need source'})])
             if task == 'shell' and not any(x.get('type') == 'function_call_output' for x in payload['input']):
                 return response(calls=[('run_command', {'id': 'sleep'})])
+            if task == 'clone' and not any(x.get('type') == 'function_call_output' for x in payload['input']):
+                source = Path(job['arguments']['cwd'])/'source.py'
+                return response(calls=[('clone_file', {'source_path': str(source), 'path': 'candidate.py',
+                    'source_sha256': p.pin(source)['sha256'],
+                    'edits': [{'old_text': 'old', 'new_text': 'new'}]})])
             return response('verified fixture evidence')
         finally:
             event['end'] = time.time()
@@ -120,6 +125,9 @@ class AsyncTests(unittest.TestCase):
         observed = self.until(task_id='one')
         done = observed['structuredContent']['tasks'][0]
         self.assertEqual(done['status'], 'completed')
+        self.assertEqual(done['execution']['steps'], 1)
+        self.assertEqual(done['execution']['progress']['writes_returned'], 0)
+        self.assertNotIn('action_records', done['execution'])
         self.assertTrue(Path(done['result']['structuredContent']['report_path']).is_file())
         self.assertEqual(done['report_path'],done['result']['structuredContent']['report_path'])
         self.assertIn('verified fixture evidence', '\n'.join(x['text'] for x in observed['content']))
@@ -225,6 +233,27 @@ class AsyncTests(unittest.TestCase):
         self.call(action='cancel',task_id='b')
         self.until(batch_id='batch')
         self.assertEqual([x['task_id'] for x in self.events()],['a'])
+
+    def test_live_clone_progress_and_deliverable_survive_real_worker(self):
+        self.write('source.py', 'old\n')
+        contract = self.write('delivery-contract.json', {'schema': 'DEEPSEEK_TASK_V2',
+            'objective': 'bounded clone', 'acceptance': ['new output'], 'read_paths': ['source.py'],
+            'write_paths': ['candidate.py'], 'commands': [],
+            'deliverables': [{'path': 'candidate.py', 'must_change': True}]})
+        self.call(action='submit', **self.task('delivery', task='clone', context='.6',
+                                             contract_path=contract, allow_write=True))
+        live = self.until(task_id='delivery', predicate=lambda m:
+            m['status'] == 'running' and m['tasks'][0].get('execution', {}).get('progress', {}).get('writes_returned') == 1)
+        self.assertFalse(live['structuredContent']['all_completed'])
+        self.assertNotIn('old', json.dumps(live['structuredContent']['tasks'][0]['execution']))
+        done = self.until(task_id='delivery')
+        self.assertEqual(done['structuredContent']['status'], 'completed')
+        self.assertEqual((self.root/'candidate.py').read_text(), 'new\n')
+        self.assertTrue(done['structuredContent']['tasks'][0]['result']['structuredContent']['acceptance_checks'][0]['passed'])
+        self.call(action='submit', **self.task('delivery', task='clone', context='.6',
+                                             contract_path=contract, allow_write=True))
+        self.assertEqual(len(self.procs), 1)
+        self.api.assert_not_called()
 
     def test_crashed_worker_is_unknown_and_never_restarted(self):
         task=self.task('a',task='crash')
