@@ -1,0 +1,10 @@
+{
+  "objective": "Review the specified source against its specification",
+  "acceptance": ["Report findings with source references and unresolved questions"],
+  "read_paths": ["spec.md", "src/module.py"],
+  "write_paths": [],
+  "pinned_read_paths": ["spec.md"],
+  "dependencies": ["spec.md", "src/module.py"],
+  "commands": [],
+  "checks": []
+}

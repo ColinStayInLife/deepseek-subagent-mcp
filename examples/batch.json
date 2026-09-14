@@ -1,0 +1,8 @@
+{
+  "schema": "DEEPSEEK_BATCH_V1",
+  "batch_id": "example-batch-001",
+  "tasks": [
+    {"task_id":"example-review-001","task":"Read the specified source and report defects with evidence.","cwd":"/absolute/project"},
+    {"task_id":"example-tests-001","task":"Read the test suite and identify coverage gaps without executing commands.","cwd":"/absolute/project"}
+  ]
+}

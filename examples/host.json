@@ -1,0 +1,6 @@
+{
+  "schema": "DEEPSEEK_HOST_V1",
+  "conversation": [{"role":"user","text":"Example task context supplied explicitly by the controller."}],
+  "images": [],
+  "capabilities": [{"id":"source_read","description":"Controller reads an authorized source using an available host tool.","permission":"read"}]
+}

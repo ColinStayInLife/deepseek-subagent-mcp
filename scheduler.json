@@ -1,0 +1,1 @@
+{"max_workers": 3, "max_pending": 24, "queue_timeout_sec": 3600}

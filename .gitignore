@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+runs/
+backups/
+upgrade-*/
+*.log
+.env
+.env.*
+credentials*
+.credentials*
+*.pem
+*.key
+.deepseek-subagent.json
+*local*.json
+.DS_Store
