@@ -56,8 +56,9 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(stats["input_tokens"], 200)
         items = requests[1]["input"]
         self.assertTrue(any(x.get("role") == "assistant" for x in items))
-        self.assertEqual(items[-1]["call_id"], "call_0")
-        self.assertIn("evidence", items[-1]["output"])
+        tool_outputs = [x for x in items if x.get('type') == 'function_call_output']
+        self.assertEqual(tool_outputs[-1]["call_id"], "call_0")
+        self.assertIn("evidence", tool_outputs[-1]["output"])
 
     def test_incomplete_does_not_execute_write(self):
         (report, stats), _ = self.run_responses([response("partial", [
@@ -137,7 +138,8 @@ class AgentTests(unittest.TestCase):
         Path(self.cwd, "x.txt").write_text("x" * 40000)
         (_, stats), requests = self.run_responses([
             response(calls=[("read_file", {"path": "x.txt"})]), response("done")])
-        self.assertLessEqual(len(requests[1]["input"][-1]["output"]), s.MAX_TOOL_OUTPUT)
+        outputs = [x['output'] for x in requests[1]['input'] if x.get('type') == 'function_call_output']
+        self.assertLessEqual(len(outputs[-1]), s.MAX_TOOL_OUTPUT)
 
     def test_validation_no_paid_call(self):
         with patch.object(s, "call_responses") as api:

@@ -2,7 +2,7 @@
 
 An opt-in MCP server for delegating bounded tasks to DeepSeek agents, with a durable background queue, evidence tracking, and explicit host-tool handoffs.
 
-Version: **1.4.0**. Python standard library only. Designed for Linux: process identity, file locks, signals, and cancellation use Linux facilities. Use a recent Python 3 release (3.10+ syntax; tested locally with Python 3.13).
+Version: **1.5.0**. Python standard library only. Designed for Linux: process identity, file locks, signals, and cancellation use Linux facilities. Use a recent Python 3 release (3.10+ syntax; tested locally with Python 3.13).
 
 ## 功能
 
@@ -12,6 +12,16 @@ Version: **1.4.0**. Python standard library only. Designed for Linux: process id
 - 文件 SHA 快照、明确的读写契约、固定命令、验收检查及执行记录。
 - 显式传递必要会话材料和带 SHA 的图片；浏览器/连接器请求交回主控执行。
 - 可准备宿主原生代理委派，但实际启动、可用模型、工具和计费由宿主决定。
+
+## v1.5 更新
+
+- `clone_file`：按源文件 SHA 克隆 UTF-8 文本并做最多 32 项精确替换，全部成功才原子发布，已有目标不会被覆盖。
+- 成功读取的内容重新验证后若完全相同，返回已有结果的短引用，减少重复内容进入模型历史。
+- 根据上一轮真实用量及请求大小估算下一轮输入，预测超过剩余软预算时用本地记录收尾，不额外调用模型；该估算不是硬计费上限。
+- V2 契约支持 `deliverables`：检查必需文件非空，`must_change=true` 时验证文件新建或内容发生变化；不满足则 `acceptance_failed`。
+- `status/wait` 的 `execution` 元数据提供已记录的用量和写入次数，不披露提示词或推理文本。
+
+模型思考强度、默认执行预算和并发配置保持不变。实际节省比例和模型成功率尚未做付费对照实验。
 
 ## 安装
 
@@ -92,7 +102,7 @@ tool_timeout_sec = 650
 python3 prepare.py contract --cwd /absolute/project --draft draft.json --output task-contract.json
 ```
 
-草案格式见 `examples/contract-draft.json`。读取路径尽量精确，避免宽泛范围使不同任务被保守串行。目录规则以 `/` 结尾。
+草案格式见 `examples/contract-draft.json`。实施任务可增加 `"deliverables": [{"path": "src/module.py", "must_change": true}]`，该路径也须在允许写入范围内。读取路径尽量精确，避免宽泛范围使不同任务被保守串行。目录规则以 `/` 结尾。
 
 批次任务可包含 `depends_on` 任务 ID 数组；必须引用已有任务或同批任务，且不能成环。前置任务 `completed` 后才启动下游。主控需在下游任务中说明产物路径；队列不会自动注入前置报告。
 
@@ -123,9 +133,17 @@ python3 prepare.py contract --cwd /absolute/project --draft draft.json --output 
 ## 离线验证
 
 ```bash
-python3 -m unittest -v test_server.py test_project_support.py test_upgrade.py test_async_jobs.py test_public_config.py
+python3 -m unittest -v test_server.py test_project_support.py test_upgrade.py test_async_jobs.py test_execution_support.py test_public_config.py
 ```
 
 模型响应均由离线 fixture 替代，并发测试使用真实本地进程和文件锁。测试不需要 API key，不进行付费模型、真实浏览器或连接器调用。
 
 公开副本仅包含程序、合成测试和通用示例，不包含运行记录、会话数据库、私有项目参数、个人配置或历史备份。
+
+也可运行离线协议及克隆产物验证：
+
+```bash
+python3 verify_offline.py --output runs/verification/check-001
+```
+
+输出目录必须尚不存在；其中可能包含本机绝对路径，保持本地保存。需要比较旧版默认上限时，额外指定 `--baseline /absolute/path/to/previous/server.py`；未指定时该比较字段为 `null`。
