@@ -17,6 +17,7 @@ import time
 
 import project_support as project
 import state_store as state
+import workflow_support as workflow
 
 ACTIVE = {'queued', 'running', 'cancel_requested'}
 RESERVED = ACTIVE | {'needs_host', 'outcome_unknown'}
@@ -136,7 +137,7 @@ def prepare(args, root):
     if not isinstance(defaults, dict) or set(defaults) - budget_keys:
         raise ValueError('Project defaults may only configure execution budgets')
     server.validate_arguments(defaults)
-    normalized = {**defaults, **args, 'cwd': cwd, 'action': 'run',
+    normalized = {**server.budget_defaults(), **defaults, **args, 'cwd': cwd, 'action': 'run',
                   'model': args.get('model', server.DEFAULT_MODEL),
                   'effort': args.get('effort', server.DEFAULT_EFFORT)}
     for key in ('contract_path', 'host_context_path'):
@@ -274,6 +275,10 @@ def snapshot(root, args):
                        job_path=str(job_path(root, task_id)), controller_acceptance_required=True)
         result_meta = (job.get('result') or {}).get('structuredContent', {})
         summary.update(report_path=result_meta.get('report_path'), host_request=result_meta.get('host_request'))
+        summary.update(handoff_path=result_meta.get('handoff_path'),
+                       steering=workflow.Mailbox(root, task_id).summary(),
+                       followup_id=job.get('operation', {}).get('followup_id'))
+        summary['steering']['accepting'] &= job['status'] in ('queued', 'running')
         # Report counters from the durable checkpoint, never model reasoning,
         # prompts, or tool result text. Reading status never starts a model.
         receipt_path = journal.get('receipt_path')
@@ -281,7 +286,8 @@ def snapshot(root, args):
             receipt = state.read(receipt_path, {})
             summary['execution'] = {k: receipt[k] for k in (
                 'server_version', 'steps', 'tool_calls', 'input_tokens', 'output_tokens',
-                'reasoning_tokens', 'usage_complete', 'progress', 'duplicate_read_chars_avoided') if k in receipt}
+                'reasoning_tokens', 'usage_complete', 'progress', 'duplicate_read_chars_avoided',
+                'completion', 'local_verification', 'diagnostic') if k in receipt}
         if args.get('batch_id') and summary['result']:
             summary['result'] = {k: v for k, v in summary['result'].items() if k != 'content'}
         summaries.append(summary)
@@ -366,11 +372,91 @@ def resume(root, args):
     return snapshot(root, {'task_id': args['task_id']})
 
 
+def steer(root, args):
+    if set(args) != {'action', 'task_id', 'message_id', 'instruction'}:
+        raise ValueError('steer only accepts task_id, message_id and instruction')
+    ident, text = workflow.instruction(args, 'message_id')
+    with queue_lock(root):
+        job = state.read(job_path(root, args['task_id']))
+        if not job: raise ValueError('Unknown async task_id')
+        mailbox = workflow.Mailbox(root, args['task_id'])
+        # Repeated IDs are observable even after completion, never re-delivered.
+        existing = any(x['message_id'] == ident for x in mailbox.summary()['messages'])
+        if observed(job)['status'] not in ('queued', 'running') and not existing:
+            raise ValueError('Only queued/running tasks accept new steering messages')
+        receipt = mailbox.send(ident, text)
+    result = snapshot(root, {'task_id': args['task_id']})
+    result['structuredContent']['steering_message'] = receipt
+    return result
+
+
+def followup(root, args):
+    if set(args) != {'action', 'task_id', 'followup_id', 'instruction'}:
+        raise ValueError('followup only accepts task_id, followup_id and instruction')
+    ident, _ = workflow.instruction(args, 'followup_id')
+    with queue_lock(root):
+        target = job_path(root, args['task_id'])
+        job = state.read(target)
+        if not job: raise ValueError('Unknown async task_id')
+        old = job.get('followup_requests', {}).get(ident)
+        if old:
+            if old != state.digest(args): raise ValueError('followup_id has different instructions')
+            return snapshot(root, {'task_id': args['task_id']})
+        if observed(job)['status'] not in workflow.SAFE_STOPS:
+            raise ValueError('Task is not at a safe followup boundary')
+        if len(job.get('followup_requests', {})) >= 24:
+            raise ValueError('Task followup limit reached')
+        journal = state.read(state.task_directory(root, args['task_id']) / 'task.json')
+        workflow.load_followup(journal)
+        if sum(observed(x)['status'] in RESERVED for x in jobs(root)) >= config()['max_pending']:
+            raise ValueError('Async queue full')
+        # Same scopes/pins/dependencies; the normal worker revalidates them and
+        # reacquires conflict scheduling before any model or file operation.
+        job.setdefault('followup_requests', {})[ident] = state.digest(args)
+        job.update(operation=dict(args))
+        job.pop('resume_source', None)
+        workflow.Mailbox(root, args['task_id']).open()
+        launch(root, job)
+    return snapshot(root, {'task_id': args['task_id']})
+
+
+def reconcile(root, args):
+    if set(args) != {'action', 'task_id', 'reconciliation_path'}:
+        raise ValueError('reconcile only accepts task_id and reconciliation_path')
+    with queue_lock(root), state.lock(state.task_directory(root, args['task_id']) / 'task.lock'):
+        target = job_path(root, args['task_id'])
+        job = state.read(target)
+        if not job: raise ValueError('Unknown async task_id')
+        source = project.pin(args['reconciliation_path'])
+        if job.get('reconciliation', {}).get('source') == source:
+            return snapshot(root, {'task_id': args['task_id']})
+        if observed(job)['status'] != 'outcome_unknown' or alive(job):
+            raise ValueError('Reconciliation requires an unknown outcome and a stopped worker')
+        journal_path = state.task_directory(root, args['task_id']) / 'task.json'
+        journal = state.read(journal_path, {})
+        review = workflow.reconcile_packet(args['reconciliation_path'], job, journal)
+        if review['source'] != source: raise ValueError('Reconciliation packet changed during review')
+        if review['review']['job_pin'] != project.pin(target):
+            raise ValueError('Reconciliation job changed; inspect its current state')
+        result = {'content': [{'type': 'text', 'text': 'Controller review recorded; scope released. Effects were not replayed or rolled back; task remains unaccepted.'}],
+                  'isError': False, 'structuredContent': {'status': 'reconciled', 'task_id': args['task_id'],
+                    'controller_acceptance_required': True, 'reconciliation_source': source}}
+        journal.update(status='reconciled', result=result, reconciliation=review)
+        state.atomic_json(journal_path, journal)
+        job.update(status='reconciled', reconciliation=review, prior_result=job.get('result'), result=result)
+        state.atomic_json(target, job)
+        workflow.Mailbox(root, args['task_id']).poll(stop=True)
+    return snapshot(root, {'task_id': args['task_id']})
+
+
 def route(root, args):
     action = args.get('action', 'run')
     task_owned = bool(args.get('task_id') and job_path(root, args['task_id']).is_file())
     if action == 'submit':
         return submit(root, [{k: v for k, v in args.items() if k != 'action'}])
+    if action in ('steer', 'reconcile'):
+        return {'steer': steer, 'reconcile': reconcile}[action](root, args)
+    if task_owned and action == 'followup': return followup(root, args)
     if action == 'batch':
         if set(args) - {'action', 'batch_path'}: raise ValueError('batch only accepts batch_path')
         if not Path(args.get('batch_path', '')).is_absolute(): raise ValueError('batch_path must be absolute')
@@ -448,6 +534,11 @@ def worker(root, task_id):
             status = result_status(result)
             journal = state.read(state.task_directory(root, task_id) / 'task.json', {})
             if journal.get('status') == 'started_outcome_unknown': status = 'outcome_unknown'
+            receipt = state.read(journal['receipt_path'], {}) if journal.get('receipt_path') else {}
+            if any(x.get('status') == 'started_outcome_unknown' and x.get('tool') in
+                   {'write_file', 'edit_file', 'clone_file', 'run_command', 'run_shell'}
+                   for x in receipt.get('action_records', [])):
+                status = 'outcome_unknown'
             if current.get('cancel') and status not in ('completed', 'outcome_unknown'): status = 'cancelled'
             current.update(status=status, result=result, finished_at=time.time())
             state.atomic_json(target, current)

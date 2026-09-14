@@ -129,6 +129,22 @@ def next_input_estimate(request_bytes, previous_bytes, previous_input, has_image
     return math.ceil(previous_input * ratio * 1.15 + 256)
 
 
+def context_projection(request_bytes, calibrated_input, output_tokens, window, margin, has_images=False):
+    """Reserve generation room separately from cumulative usage/wire limits.
+
+    Without provider usage, one UTF-8 byte per input token is a conservative
+    text heuristic, not the provider tokenizer. Later requests use the existing
+    usage-calibrated estimate. Image tokens cannot be inferred from wire bytes;
+    record that uncertainty rather than claiming an exact 1M context check.
+    """
+    estimated = calibrated_input if calibrated_input is not None else request_bytes
+    return {'estimated_input_tokens': estimated, 'reserved_output_tokens': output_tokens,
+            'margin_tokens': margin, 'window_tokens': window,
+            'projected_tokens': estimated + output_tokens + margin,
+            'method': 'usage_calibrated' if calibrated_input is not None else 'utf8_bytes_heuristic',
+            'is_estimate': True, 'uncalibrated_images': bool(has_images and calibrated_input is None)}
+
+
 def duplicate_read_note(name, raw, result, prior_records):
     """Compact only freshly revalidated, byte-identical successful reads.
 
