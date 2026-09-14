@@ -30,7 +30,8 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parent
     os.chdir(root)
-    modules = ['test_server', 'test_project_support', 'test_upgrade', 'test_async_jobs', 'test_execution_support']
+    modules = ['test_server', 'test_project_support', 'test_upgrade', 'test_async_jobs',
+               'test_execution_support', 'test_workflow_support', 'test_budget_completion', 'test_budget_settings']
     stream = io.StringIO()
     environment = {'DEEPSEEK_API_BASE': 'http://127.0.0.1:9', 'DEEPSEEK_API_KEY': 'offline-test-only'}
     # Direct accidental API use fails before credentials/network. Subprocess
@@ -55,6 +56,7 @@ def main():
     replies = [json.loads(line) for line in proc.stdout.splitlines()]
     protocol_ok = (proc.returncode == 0 and [r.get('id') for r in replies] == [1, 2, 3]
                    and replies[0]['result']['serverInfo']['version'] == server.SERVER_VERSION
+                   and {'steer', 'followup', 'reconcile'} <= set(replies[1]['result']['tools'][0]['inputSchema']['properties']['action']['enum'])
                    and replies[2]['result']['isError'] is True
                    and not (output/'probe-runs/usage.jsonl').exists())
     (output/'stdio.json').write_text(json.dumps(replies, ensure_ascii=False, indent=2)+'\n')
@@ -89,9 +91,16 @@ def main():
                           'clone_argument_bytes': clone_size, 'full_write_argument_bytes': full_size,
                           'interpretation': 'Synthetic request-size comparison; not a paid model or task-success benchmark'},
         'defaults_and_limits_unchanged': limits_unchanged,
+        'effective_defaults': server.budget_defaults(),
+        'configurable_limits': {k: server.TOOL_DEF['inputSchema']['properties'][k]['maximum']
+                                for k in server.budget_defaults()},
+        'request_limits': {'text_bytes': server.MAX_REQUEST_BYTES,
+                           'context_window_tokens': server.MODEL_CONTEXT_TOKENS,
+                           'context_projection_is_estimate': True},
         'paid_model_calls': 0, 'real_model_effectiveness_measured': False,
         'live_connections_restarted': False,
         'sources': [project.pin(root/name) for name in ['server.py', 'execution_support.py', 'project_support.py',
+                    'workflow_support.py', 'host_bridge.py', 'state_store.py', 'client.py',
                     'prepare.py', 'async_jobs.py', 'verify_offline.py', 'scheduler.json'] + [m+'.py' for m in modules]]}
     (output/'VALIDATION.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n')
     print(json.dumps({k: report[k] for k in ('status', 'server_version', 'tests', 'paid_model_calls')}, ensure_ascii=False))

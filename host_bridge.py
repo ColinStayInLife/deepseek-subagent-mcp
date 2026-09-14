@@ -12,7 +12,7 @@ import uuid
 import project_support as project
 import state_store as state
 
-MAX_PACKET_BYTES = 192000
+MAX_PACKET_BYTES = 4 * 1024 * 1024  # Explicit conversation material; separate from image wire limits.
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGES = 8
 MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024

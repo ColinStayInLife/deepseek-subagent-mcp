@@ -12,6 +12,9 @@ import subprocess
 import sys
 from pathlib import Path
 import state_store as state
+from server import HARD_TIMEOUT
+
+CLIENT_TIMEOUT = HARD_TIMEOUT + 60
 
 
 def main():
@@ -46,7 +49,7 @@ def main():
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, start_new_session=True)
     try:
-        stdout, stderr = proc.communicate('\n'.join(json.dumps(x, ensure_ascii=False) for x in messages) + '\n', timeout=660)
+        stdout, stderr = proc.communicate('\n'.join(json.dumps(x, ensure_ascii=False) for x in messages) + '\n', timeout=CLIENT_TIMEOUT)
     except BaseException:
         # The server owns its command groups. SIGTERM first interrupts Python
         # so its finally blocks clean them; SIGKILL is only the final fallback.

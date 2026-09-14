@@ -31,15 +31,19 @@ def fixture_worker(root, task_id):
             if task == 'crash': os._exit(9)
             time.sleep(float(job['arguments'].get('context') or .1))
             if task == 'fail': return response(status='incomplete')
+            if task == 'steer' and 'Controller steering' not in json.dumps(payload['input']):
+                return response(calls=[('write_file', {'path': 'stale.txt', 'content': 'obsolete'})])
             if task == 'host' and not any(x.get('type') == 'function_call_output' for x in payload['input']):
                 return response(calls=[('request_host', {'capability': 'read', 'arguments': {'query': 'evidence'}, 'reason': 'need source'})])
             if task == 'shell' and not any(x.get('type') == 'function_call_output' for x in payload['input']):
                 return response(calls=[('run_command', {'id': 'sleep'})])
-            if task == 'clone' and not any(x.get('type') == 'function_call_output' for x in payload['input']):
+            if task in ('clone', 'budget-clone') and not any(x.get('type') == 'function_call_output' for x in payload['input']):
                 source = Path(job['arguments']['cwd'])/'source.py'
-                return response(calls=[('clone_file', {'source_path': str(source), 'path': 'candidate.py',
+                reply = response(calls=[('clone_file', {'source_path': str(source), 'path': 'candidate.py',
                     'source_sha256': p.pin(source)['sha256'],
                     'edits': [{'old_text': 'old', 'new_text': 'new'}]})])
+                if task == 'budget-clone': reply['usage']['input_tokens'] = 1000
+                return reply
             return response('verified fixture evidence')
         finally:
             event['end'] = time.time()
@@ -395,8 +399,93 @@ class AsyncTests(unittest.TestCase):
         pid=int(pid_path.read_text())
         self.call(action='cancel',task_id='sleep')
         result=self.until(task_id='sleep')
-        self.assertEqual(result['structuredContent']['status'],'cancelled',result)
+        self.assertEqual(result['structuredContent']['status'],'outcome_unknown',result)
         self.assertIsNone(a.process_identity(pid))
+
+    def test_steer_running_worker_is_durable_idempotent_and_bounded(self):
+        contract = self.contract('contract', [str(self.root)+'/'], [str(self.root/'stale.txt')])
+        self.call(action='submit', **self.task('steer-task', task='steer', context='.4', allow_write=True, contract_path=contract))
+        self.until(task_id='steer-task', predicate=lambda m: m['status'] == 'running')
+        message = dict(action='steer', task_id='steer-task', message_id='revision-1', instruction='Skip stale writes and report')
+        result = self.call(**message)
+        self.assertFalse(result['isError'], result)
+        self.assertFalse(self.call(**message)['isError'])
+        self.assertTrue(self.call(**{**message, 'instruction': 'different'})['isError'])
+        self.assertTrue(self.call(**{**message, 'allow_write': True})['isError'])
+        done = self.until(task_id='steer-task')['structuredContent']['tasks'][0]
+        self.assertEqual(done['status'], 'completed')
+        self.assertFalse((self.root/'stale.txt').exists())
+        self.assertEqual(done['steering']['messages'], [{'message_id': 'revision-1', 'applied': True}])
+        self.assertTrue(self.call(**message)['structuredContent']['steering_message']['reused'])
+        self.assertTrue(self.call(**{**message, 'message_id': 'late'})['isError'])
+        self.api.assert_not_called()
+
+    def test_async_followup_returns_immediately_and_reuses_original_budget(self):
+        self.call(action='submit', **self.task('one', context='.6'))
+        first = self.until(task_id='one')['structuredContent']['tasks'][0]
+        args = dict(action='followup', task_id='one', followup_id='fix-1', instruction='Recheck the selected result')
+        started = time.monotonic()
+        result = self.call(**args)
+        self.assertFalse(result['isError'], result)
+        self.assertLess(time.monotonic()-started, .5)
+        self.assertFalse(self.call(**args)['isError'])
+        done = self.until(task_id='one')['structuredContent']['tasks'][0]
+        self.assertEqual(done['status'], 'completed', done)
+        self.assertEqual(done['execution']['steps'], 2)
+        self.assertEqual(done['execution']['input_tokens'], 200)
+        self.assertEqual(len(self.procs), 2)
+        self.assertFalse(self.call(**args)['isError'])
+        self.assertEqual(len(self.procs), 2)
+        self.assertTrue(self.call(**{**args, 'instruction': 'different'})['isError'])
+        self.assertEqual(first['result']['structuredContent']['budgets'], done['result']['structuredContent']['budgets'])
+
+    def test_reconcile_unknown_releases_scope_without_replaying_or_accepting(self):
+        self.call(action='submit', **self.task('crash-task', task='crash'))
+        self.until(task_id='crash-task')
+        target = a.job_path(self.runs, 'crash-task')
+        journal = state.read(state.task_directory(self.runs, 'crash-task')/'task.json')
+        evidence = self.write('review.txt', 'Checked: no files changed and no external actions running')
+        value = {'schema': 'DEEPSEEK_RECONCILE_V1', 'task_id': 'crash-task', 'job_pin': p.pin(target),
+                 'receipt_pin': p.pin(journal['receipt_path']), 'note': 'Controller verified the stopped attempt',
+                 'effects_reviewed': True, 'no_processes_running': True, 'evidence': [p.pin(evidence)]}
+        path = self.write('review.json', value)
+        args = dict(action='reconcile', task_id='crash-task', reconciliation_path=path)
+        wrong = dict(value); wrong['receipt_pin'] = None
+        self.write('review.json', wrong)
+        self.assertTrue(self.call(**args)['isError'])
+        self.write('review.json', value)
+        result = self.call(**args)
+        self.assertFalse(result['isError'], result)
+        self.assertEqual(result['structuredContent']['status'], 'reconciled')
+        self.assertFalse(result['structuredContent']['all_completed'])
+        self.assertFalse(self.call(**args)['isError'])
+        self.assertEqual(len(self.procs), 1)
+        self.assertTrue(self.call(action='followup', task_id='crash-task', followup_id='unsafe', instruction='retry')['isError'])
+        self.assertEqual(len(self.procs), 1)
+
+    def test_reconcile_rejects_live_worker_and_changed_evidence(self):
+        self.call(action='submit', **self.task('live', context='2'))
+        self.until(task_id='live', predicate=lambda m: m['status'] == 'running')
+        path = self.write('review.json', {})
+        self.assertTrue(self.call(action='reconcile', task_id='live', reconciliation_path=path)['isError'])
+        self.call(action='cancel', task_id='live')
+
+    def test_budget_stop_with_passed_artifacts_does_not_run_dependency(self):
+        self.write('source.py', 'old')
+        contract = self.contract('contract', [str(self.root/'source.py')], [str(self.root/'candidate.py')])
+        value = json.loads(Path(contract).read_text())
+        value['deliverables'] = [{'path': 'candidate.py', 'must_change': True}]
+        Path(contract).write_text(json.dumps(value))
+        self.batch([self.task('up', task='budget-clone', input_budget=1000, allow_write=True, contract_path=contract),
+                    self.task('down', depends_on=['up'])])
+        result = self.until(batch_id='batch')
+        tasks = {x['task_id']: x for x in result['structuredContent']['tasks']}
+        self.assertEqual(tasks['up']['status'], 'input_budget')
+        self.assertEqual(tasks['up']['execution']['local_verification']['status'], 'passed')
+        self.assertEqual(tasks['up']['execution']['completion']['controller_acceptance'], 'pending')
+        self.assertEqual(tasks['down']['status'], 'blocked_dependency')
+        self.assertEqual([x['task_id'] for x in self.events()], ['up'])
+        self.assertEqual((self.root/'candidate.py').read_text(), 'new')
 
 
 if __name__=='__main__':

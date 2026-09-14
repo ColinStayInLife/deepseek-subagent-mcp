@@ -37,6 +37,7 @@ import project_support as project
 import state_store as state
 import host_bridge as bridge
 import execution_support as execution
+import workflow_support as workflow
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -46,7 +47,7 @@ API_BASE = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com")
 API_URL = API_BASE.rstrip("/") + "/responses"
 
 SERVER_NAME = "deepseek-subagent"
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.7.0"
 PROTOCOL_FALLBACK = "2024-11-05"
 
 DEFAULT_MODEL = os.environ.get("DEEPSEEK_SUBAGENT_MODEL", "deepseek-flash")
@@ -58,14 +59,26 @@ MAX_TOOL_OUTPUT = 6_000           # 每次工具结果在入历史前截断
 MAX_FINAL_CHARS = 4_000           # 主控只读短报告；完整报告落盘
 DEFAULT_MAX_STEPS = 12
 HARD_MAX_STEPS = 24
-DEFAULT_TIMEOUT = 360
-HARD_TIMEOUT = 600
-DEFAULT_MAX_OUTPUT_TOKENS = 8192  # 单轮，含推理；优先减少返工到 Astra
-DEFAULT_OUTPUT_BUDGET = 32_000    # 整个任务所有轮次累计
-DEFAULT_INPUT_BUDGET = 120_000    # 用量软阈值：在下一轮前检查
-MAX_REQUEST_BYTES = 192_000      # 本地硬限制，非精确 tokenizer
+DEFAULT_TIMEOUT = 1200
+HARD_TIMEOUT = 3600
+DEFAULT_MAX_OUTPUT_TOKENS = 65_536  # 单轮，含推理及工具参数
+HARD_MAX_OUTPUT_TOKENS = 131_072    # 本 MCP 的长任务档位，非模型能力上限
+DEFAULT_OUTPUT_BUDGET = 128_000    # 整个任务所有轮次累计
+HARD_OUTPUT_BUDGET = 500_000
+DEFAULT_INPUT_BUDGET = 500_000     # 用量软阈值：在下一轮前检查
+HARD_INPUT_BUDGET = 500_000
+MAX_REQUEST_BYTES = 4 * 1024 * 1024  # 独立的序列化文本大小保护，不当作 token 数
+MODEL_CONTEXT_TOKENS = 1_000_000
+CONTEXT_MARGIN_TOKENS = 16_384
 MAX_TOOL_CALLS = 40
 RUNS_DIR = Path(os.environ.get("DEEPSEEK_SUBAGENT_RUNS_DIR", str(Path(__file__).parent / "runs")))
+
+
+def budget_defaults():
+    """Freeze all effective defaults when a background task is submitted."""
+    return {'max_steps': DEFAULT_MAX_STEPS, 'timeout_sec': DEFAULT_TIMEOUT,
+            'max_output_tokens': DEFAULT_MAX_OUTPUT_TOKENS,
+            'output_budget': DEFAULT_OUTPUT_BUDGET, 'input_budget': DEFAULT_INPUT_BUDGET}
 
 
 class DeadlineExceeded(RuntimeError):
@@ -485,6 +498,8 @@ JSON报告先用json_query查看键和数组长度，再用JSON Pointer只取必
 修改现有文件优先 edit_file。验证只覆盖本次变更；检查通过即停止。
 基于旧文件创建新版本时，先取 SHA 和必要片段，再用 clone_file 提交差异，不要整文件重写。
 任务已给明确实现方案时，在必要读取完成后立即落实；不要反复规划已确定的设计。
+复杂实现按主控已定接口完成可独立验证的部分；不要在一轮中推演整个系统，不以空壳、占位或跳过负控充当完成。
+若实现仍需要新的架构或科学判断，简短报告具体缺口交回主控，不擅自扩展接口或猜测参数。
 契约按具体文件授权时，直接使用 read_paths 中的文件，不能对父目录 list_dir/grep。
 deliverables 是必须实际落盘的产物；must_change=true 不能用原有未改文件交差。
 多个独立读取可在同轮调用工具；不要嵌套启动其他模型或子代理。
@@ -503,7 +518,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
                  output_budget: int = DEFAULT_OUTPUT_BUDGET,
                  input_budget: int = DEFAULT_INPUT_BUDGET, project_settings=None,
                  contract=None, record_dir=None, host_packet=None,
-                 resume_state=None, resume_items=None) -> tuple[str, dict]:
+                 resume_state=None, resume_items=None, task_id=None) -> tuple[str, dict]:
     started = time.monotonic()
     elapsed_before = (resume_state or {}).get('stats', {}).get('elapsed_sec', 0)
     deadline = started + max(0, timeout_sec - elapsed_before)
@@ -532,6 +547,8 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
              "effort": effort, "status": "running", "usage_complete": True,
              "tool_errors": 0, "actions": [], "action_records": [], "evidence_files": [],
              "server_version": SERVER_VERSION, "task_contract": contract['pin'] if contract else None,
+             "permission_scopes": state.digest(contract['scopes']) if contract else None,
+             "cwd": cwd,
              "project_config": settings.get('_config_pin'), "tool_output_chars": tool_cap,
              "budgets": {'max_steps': max_steps, 'timeout_sec': timeout_sec,
                          'max_output_tokens': max_output_tokens, 'output_budget': output_budget,
@@ -543,9 +560,15 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
     executed = set()
     last_input = 0
     last_request_bytes = 0
+    model_report_received = False
+    mailbox = workflow.Mailbox(RUNS_DIR, task_id) if task_id else None
     if resume_state:
         if resume_state['stats']['task_contract'] != (contract['pin'] if contract else None) or resume_state['stats']['project_config'] != settings.get('_config_pin'):
             raise ValueError('Contract/project changed since host handoff; inspect previous results before a new task')
+        if 'permission_scopes' in resume_state['stats'] and resume_state['stats']['permission_scopes'] != (state.digest(contract['scopes']) if contract else None):
+            raise ValueError('Permission scopes changed since the checkpoint')
+        if model != resume_state['stats']['model'] or effort != resume_state['stats']['effort']:
+            raise ValueError('Continuation cannot change the original model or effort')
         stats = resume_state['stats']
         stats['status'] = 'running'
         stats.pop('host_request', None)
@@ -556,8 +579,11 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
         last_request_bytes = resume_state.get('last_request_bytes', 0)
     stats.setdefault('round_records', [])
     stats.setdefault('duplicate_read_chars_avoided', 0)
+    for field in ('diagnostic', 'completion', 'local_verification', 'acceptance_checks'):
+        stats.pop(field, None)  # A later segment cannot inherit old acceptance.
     stats['host_context'] = {'packet': host_packet['pin'], 'images': host_packet['images'],
                              'capabilities': host_packet['capabilities']}
+    if mailbox: mailbox.open()
 
     def checkpoint():
         stats['progress'] = execution.progress(stats['action_records'])
@@ -570,16 +596,54 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
         state.atomic_json(target, value)
 
     def finish(status: str, detail: str = "") -> tuple[str, dict]:
+        if mailbox:
+            mailbox.poll(stop=True)
+            stats['steering'] = mailbox.summary()
+        stats['acceptance_checks'] = []
+        verification = workflow.verification_gate(status, items, stats, contract)
+        stats['local_verification'] = verification
+        if verification['status'] == 'eligible':
+            remaining_check_time = min(5.0, deadline - time.monotonic())
+            if remaining_check_time <= 0:
+                verification.update(status='deferred', reason='wall_budget_exhausted')
+            else:
+                try:
+                    # Only inspect existing files. Never call run_command,
+                    # import the generated program, or buy a model summary.
+                    with wall_deadline(remaining_check_time):
+                        checks = project.acceptance_results(contract, cwd)
+                        checks += execution.deliverable_results(contract, cwd, stats.get('deliverable_baseline', {}))
+                    stats['acceptance_checks'] = checks
+                    verification.update(status=('passed' if checks and all(x['passed'] for x in checks) else 'failed'),
+                                        checked=len(checks))
+                except DeadlineExceeded:
+                    verification.update(status='deferred', reason='local_check_time_limit')
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    verification.update(status='deferred', reason='local_check_error', error=str(exc)[:300])
         if status == 'completed':
-            stats['acceptance_checks'] = project.acceptance_results(contract, cwd)
-            stats['acceptance_checks'] += execution.deliverable_results(
-                contract, cwd, stats.get('deliverable_baseline', {}))
-            if any(not x['passed'] for x in stats['acceptance_checks']):
+            if verification['status'] == 'failed':
                 status, detail = 'acceptance_failed', '契约中的机器检查未通过；主控须核对证据'
+            elif verification['status'] == 'deferred':
+                status, detail = 'acceptance_deferred', '本地检查未完成；主控须核对证据'
+        # Keep budget/API stop status even when local checks pass: dependencies
+        # must never auto-start on the strength of a partial mechanical check.
+        stats['completion'] = {'execution': status, 'verification': verification['status'],
+                               'model_report': 'received' if model_report_received else 'not_received',
+                               'controller_acceptance': 'pending'}
         stats["status"] = status
         stats['stop_detail'] = detail
         stats["elapsed_sec"] = round(elapsed_before + time.monotonic() - started, 3)
         checkpoint()
+        if record_dir is not None:
+            # Replace only at safe, fully paired boundaries. An old checkpoint
+            # must never survive a failed/unknown later segment as resumable.
+            followup_path = record_dir / 'followup.json'
+            if workflow.can_checkpoint(items, stats):
+                state.atomic_json(followup_path, {'items': items, 'stats': stats,
+                    'seen': seen, 'executed': sorted(executed), 'last_input': last_input,
+                    'last_request_bytes': last_request_bytes, 'host_packet': host_packet})
+            else:
+                followup_path.unlink(missing_ok=True)
         if status == 'needs_host' and record_dir is not None:
             # Private continuation data includes only the Flash API conversation,
             # never the host's credentials or hidden reasoning.
@@ -589,12 +653,18 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
         if status == "completed":
             return last_text, stats
         actions = "\n".join(stats["actions"][-6:])
-        report = f"未完成（{status}）：{detail}"
+        report = f"模型执行已停止（{status}）：{detail}"
+        local_lines = workflow.local_report_lines(stats)
+        if local_lines:
+            report += '\n' + '\n'.join(local_lines)
         if last_text:
             report += f"\n部分文本（不是完成证明）：\n{last_text}"
         if actions:
             report += f"\n已执行工具摘要：\n{actions}"
-        report += "\n请主控先检查现有结果再续派；写入或命令可能已执行，不要盲目重发。"
+        if verification['status'] == 'passed':
+            report += "\n请主控核对原任务完整性；若已满足，无需为补模型收尾重跑任务。"
+        elif not stats.get('diagnostic'):
+            report += "\n请主控先检查现有结果再续派；写入或命令可能已执行，不要盲目重发。"
         return report, stats
 
     try:
@@ -602,6 +672,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
             stats['deliverable_baseline'] = execution.deliverable_baseline(contract, cwd)
         checkpoint()
         for step in range(stats['steps'], max_steps):
+            if mailbox: workflow.append_updates(items, mailbox.poll(), stats)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return finish("timeout", "墙钟预算耗尽")
@@ -618,8 +689,12 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
             task_progress = execution.progress(stats['action_records'])
             note = (f"执行预算：剩余输入软阈值 {input_budget - stats['input_tokens']}，"
                     f"剩余累计输出 {remaining_output}（含推理），剩余轮数 {max_steps - step}。")
-            if allow_write and step >= 2 and task_progress['writes_returned'] == 0:
+            if allow_write and step >= 1 and task_progress['writes_returned'] == 0:
                 note += ' 尚无成功写入；若必要证据已齐，请落实限定改动并验证。若缺少关键输入，准确报告缺口，不猜参数。'
+                note += ' 先实现已定接口下可独立验证的部分，不一次推演整个模块；不得用占位实现交差。'
+                new_paths = [path for path, before in stats.get('deliverable_baseline', {}).items() if before is None]
+                if new_paths:
+                    note += ' 任务开始时尚不存在的目标文件（最多列4项，完整范围见契约；允许创建不表示已有可读内容）：' + json.dumps(new_paths[:4], ensure_ascii=False)
             if task_progress['tool_errors']:
                 note += ' 已有工具错误；先按返回原因修正路径或参数，勿重复扩大搜索范围。'
             payload = {
@@ -632,12 +707,37 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
                 payload["input"] = items + [{"role": "user", "content":
                     "本轮预算即将结束，请停止调用工具，汇报实际完成内容、证据和未完成项。"}]
             request_bytes, wire_bytes = bridge.request_sizes(payload)
-            stats["peak_request_bytes"] = max(stats.get("peak_request_bytes", 0), request_bytes)
-            stats['peak_wire_bytes'] = max(stats.get('peak_wire_bytes', 0), wire_bytes)
-            if request_bytes > MAX_REQUEST_BYTES or wire_bytes > bridge.MAX_VISION_REQUEST_BYTES:
-                return finish("context_budget", f"请求超过 {MAX_REQUEST_BYTES} 字节，请拆小任务或缩小文件范围")
             estimate = execution.next_input_estimate(request_bytes, last_request_bytes,
                                                      last_input, bool(host_packet['images']))
+            context_projection = execution.context_projection(
+                request_bytes, estimate, payload['max_output_tokens'],
+                MODEL_CONTEXT_TOKENS, CONTEXT_MARGIN_TOKENS, bool(host_packet['images']))
+            if record_dir is not None and (request_bytes > MAX_REQUEST_BYTES * .8 or
+                    context_projection['projected_tokens'] > MODEL_CONTEXT_TOKENS * .9 or
+                    (estimate is not None and estimate > input_budget - stats['input_tokens'])):
+                pruned, change = workflow.prune_outputs(items, stats['action_records'])
+                if change['results']:
+                    archive = record_dir / ('context-before-prune-' + str(step) + '.json')
+                    state.atomic_json(archive, {'items': items})
+                    items = pruned
+                    payload['input'] = items + payload['input'][-1:]
+                    stats.setdefault('context_pruning', []).append({**change, 'step': step, 'archive': project.pin(archive)})
+                    request_bytes, wire_bytes = bridge.request_sizes(payload)
+            stats["peak_request_bytes"] = max(stats.get("peak_request_bytes", 0), request_bytes)
+            stats['peak_wire_bytes'] = max(stats.get('peak_wire_bytes', 0), wire_bytes)
+            if request_bytes > MAX_REQUEST_BYTES:
+                return finish("context_budget", f"文本请求超过 {MAX_REQUEST_BYTES} UTF-8 字节大小上限；这不是 token 上限")
+            if wire_bytes > bridge.MAX_VISION_REQUEST_BYTES:
+                return finish("context_budget", f"含图片的完整请求超过 {bridge.MAX_VISION_REQUEST_BYTES} 字节大小上限")
+            estimate = execution.next_input_estimate(request_bytes, last_request_bytes,
+                                                     last_input, bool(host_packet['images']))
+            context_projection = execution.context_projection(
+                request_bytes, estimate, payload['max_output_tokens'],
+                MODEL_CONTEXT_TOKENS, CONTEXT_MARGIN_TOKENS, bool(host_packet['images']))
+            stats['context_projection'] = context_projection
+            if context_projection['projected_tokens'] > MODEL_CONTEXT_TOKENS:
+                return finish('context_budget',
+                              f"上下文估算输入 {context_projection['estimated_input_tokens']} + 输出预留 {payload['max_output_tokens']} + 余量 {CONTEXT_MARGIN_TOKENS} 超过 {MODEL_CONTEXT_TOKENS}；这是本地估算，非精确 tokenizer")
             stats['next_input_estimate'] = estimate
             if estimate is not None and estimate > input_budget - stats['input_tokens']:
                 return finish('input_budget_prediction',
@@ -645,6 +745,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
             stats["steps"] = step + 1
             round_record = {'step': step + 1, 'status': 'started_usage_unknown',
                             'request_bytes': request_bytes, 'estimated_input_tokens': estimate,
+                            'context_projection': context_projection,
                             'max_output_tokens': payload['max_output_tokens'],
                             'tool_choice': payload['tool_choice'],
                             'progress_before': task_progress}
@@ -674,6 +775,8 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
             last_text = "\n".join(texts).strip()
             status = resp.get("status", "completed")
             if resp.get("error") or status != "completed":
+                if status == 'incomplete':
+                    stats['diagnostic'] = workflow.output_diagnostic(resp, round_record, stats)
                 return finish("api_incomplete" if status == "incomplete" else "api_error",
                               _clip(json.dumps(resp.get("error") or resp.get("incomplete_details") or status,
                                                ensure_ascii=False), 500))
@@ -681,6 +784,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
             for item in outputs:
                 itype = item.get("type")
                 if item.get("status") == "incomplete":
+                    stats['diagnostic'] = workflow.output_diagnostic(resp, round_record, stats)
                     return finish("api_incomplete", "输出项被截断；未执行本轮工具")
                 if itype == "function_call":
                     if not item.get("call_id") or not item.get("name"):
@@ -694,14 +798,19 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
                 elif itype == "message" and item.get("content"):
                     items.append({"type": "message", "role": "assistant", "content": item["content"]})
             if not calls:
+                if mailbox and workflow.append_updates(items, mailbox.poll(finalize=True), stats):
+                    continue
                 if not last_text:
                     return finish("empty_response", "本轮没有最终文本")
+                model_report_received = True
                 # 收尾轮只能证明已经拿到报告，不能据此宣称原任务全部完成。
                 return finish(final_reason, "已预留收尾报告；请按验收标准核对后续派") if final_round and step > 0 else finish("completed")
             if len({c['call_id'] for c in calls}) != len(calls):
                 return finish('protocol_error', '本轮重复call_id；未执行工具')
             if final_round:
                 return finish(final_reason, "模型在收尾轮仍请求工具，已停止执行")
+            if mailbox and workflow.append_updates(items, mailbox.poll(), stats, calls):
+                continue
             host_calls = [c for c in calls if c['name'] == 'request_host']
             if host_calls and host_packet['capabilities'] and record_dir is not None:
                 if stats['tool_calls'] + len(calls) > MAX_TOOL_CALLS:
@@ -720,7 +829,9 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
                         items.append({'type': 'function_call_output', 'call_id': call['call_id'],
                                       'output': '本轮宿主请求已暂停；本工具未执行，恢复后按需重新请求。'})
                 return finish('needs_host', '等待主控处理已声明的宿主工具请求；不要新建重复任务。')
-            for call in calls:
+            for call_index, call in enumerate(calls):
+                if mailbox and workflow.append_updates(items, mailbox.poll(), stats, calls[call_index:]):
+                    break
                 if time.monotonic() >= deadline:
                     return finish("timeout", "工具执行前时间已耗尽")
                 if stats["tool_calls"] >= MAX_TOOL_CALLS:
@@ -753,7 +864,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
                 except (ValueError, TypeError):
                     parsed = {}
                 safe_args = {k: v for k, v in parsed.items() if k in ('path', 'source_path', 'source_sha256', 'start_line', 'end_line', 'pointers', 'depth', 'limit', 'offset', 'id', 'cwd')} if isinstance(parsed, dict) else {}
-                action = {'sequence': stats['tool_calls'], 'tool': name, 'arguments': safe_args,
+                action = {'sequence': stats['tool_calls'], 'call_id': call['call_id'], 'tool': name, 'arguments': safe_args,
                           'arguments_sha256': hashlib.sha256(raw.encode()).hexdigest(), 'status': 'started_outcome_unknown'}
                 stats['action_records'].append(action)
                 checkpoint()  # preserve the uncertain state BEFORE possible side effects
@@ -796,6 +907,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
                     result = duplicate
                 stats["actions"][-1] = f"{name}: " + result[:240]
                 stats["tool_errors"] += int(action['status'] == 'tool_error')
+                action['history_index'] = len(items)
                 checkpoint()
                 items.append({"type": "function_call_output", "call_id": call["call_id"], "output": result})
         return finish("step_limit", "达到轮数上限")
@@ -819,6 +931,10 @@ TOOL_DEF = {
         "适合：有明确范围的代码检索/阅读、跑指定测试、按规格修改文件。"
         "授权任务优先submit异步提交或batch批量派发：立即返回，后台默认最多3个Flash并行；主控继续独立工作。"
         "wait按task_id或batch_id短暂等待变化；status读结果；cancel停止任务。批次支持depends_on，冲突读写自动串行。"
+        "steer用唯一message_id和instruction纠偏运行中任务；followup用唯一followup_id验收后续接，保留原权限和累计预算。"
+        "reconcile仅登记主控对未知结果的证据核对并释放队列范围，不重跑也不表示任务完成。"
+        "实现任务提供固定接口和可独立验证的范围；复杂模块由主控分阶段验收。推理耗尽时先读diagnostic/交接证据，不原样重派。"
+        "预算停止可生成本地契约检查：看completion/local_verification区分执行停止、产物检查和主控验收，检查通过不等于completed。"
         "host_context_path可传会话材料/图片/宿主能力；needs_host时由主控执行请求，再用同task_id和action=resume回传结果。"
         "action=native_request仅准备原生Flash委派，由主控调用宿主spawn_agent；不是本MCP直连计费，不能保证全部功能继承。"
         "默认 max/只读；遵循用户指定的思考强度；shell/写入需显式开启。"
@@ -829,7 +945,11 @@ TOOL_DEF = {
     "inputSchema": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["run", "submit", "batch", "wait", "cancel", "status", "claim", "resume", "native_request", "native_result"], "description": "submit异步提交，batch提交批次文件；status/wait查任务或批次，cancel取消。run兼容同步执行；claim认领宿主请求；resume恢复（异步任务仍后台执行）；native_request/native_result原生交接。"},
+            "action": {"type": "string", "enum": ["run", "submit", "batch", "wait", "cancel", "status", "steer", "followup", "reconcile", "claim", "resume", "native_request", "native_result"], "description": "submit/batch后台派发；steer执行中纠偏；followup安全停止后续接且不重置预算；reconcile核对未知状态。status/wait读取，cancel取消；resume仅宿主交接；native_request/native_result原生交接。"},
+            "message_id": {"type": "string", "description": "steer的幂等消息ID；同ID同内容只接收一次。"},
+            "followup_id": {"type": "string", "description": "followup的幂等续接ID；仅续接已保存的安全停止点，同ID不重复执行。"},
+            "instruction": {"type": "string", "description": "steer/followup主控补充指令，最多8192 UTF-8字节；不提高权限、预算或更换契约。"},
+            "reconciliation_path": {"type": "string", "description": "reconcile用：DEEPSEEK_RECONCILE_V1文件，绑定job/receipt和证据SHA，主控确认副作用及外部进程已核对。"},
             "batch_path": {"type": "string", "description": "batch用：绝对路径DEEPSEEK_BATCH_V1 JSON，含batch_id及tasks；每项为任务参数和可选depends_on任务ID数组。"},
             "batch_id": {"type": "string", "description": "status/wait/cancel选择已提交批次；与task_id二选一。"},
             "wait_sec": {"type": "integer", "minimum": 0, "maximum": 20, "description": "wait最多等待秒数，默认15；状态变化即返回，不调用模型，无原生推送通知。"},
@@ -883,19 +1003,19 @@ TOOL_DEF = {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": HARD_TIMEOUT,
-                "description": f"任务墙钟上限（秒），默认 {DEFAULT_TIMEOUT}。",
+                "description": f"任务累计执行时间上限（秒），默认 {DEFAULT_TIMEOUT}，最多 {HARD_TIMEOUT}；长任务用 submit/batch 后台执行。排队和宿主等待不计入。",
             },
             "max_output_tokens": {
-                "type": "integer", "minimum": 128, "maximum": 32768,
-                "description": f"单轮输出上限（含思考），默认 {DEFAULT_MAX_OUTPUT_TOKENS}。复杂 max 任务可设 16384/32768。",
+                "type": "integer", "minimum": 128, "maximum": HARD_MAX_OUTPUT_TOKENS,
+                "description": f"单轮输出上限（含思考和工具参数），默认 {DEFAULT_MAX_OUTPUT_TOKENS}；复杂任务可显式设 {HARD_MAX_OUTPUT_TOKENS}。实际还受剩余累计输出预算约束，不自动加预算或重试。",
             },
             "output_budget": {
-                "type": "integer", "minimum": 128, "maximum": 128000,
-                "description": f"整个任务累计输出 token 预算，默认 {DEFAULT_OUTPUT_BUDGET}。复杂任务可显式提高。",
+                "type": "integer", "minimum": 128, "maximum": HARD_OUTPUT_BUDGET,
+                "description": f"整个任务累计输出 token 预算，默认 {DEFAULT_OUTPUT_BUDGET}，长任务可显式提高至 {HARD_OUTPUT_BUDGET}；按实际用量计费，续接不重置。",
             },
             "input_budget": {
-                "type": "integer", "minimum": 1000, "maximum": 500000,
-                "description": "累计输入 token 软阈值，默认 120000；每轮结束后检查，可能多出一轮输入。",
+                "type": "integer", "minimum": 1000, "maximum": HARD_INPUT_BUDGET,
+                "description": f"累计输入 token 软阈值，默认 {DEFAULT_INPUT_BUDGET}（含缓存）；多轮回传累计，不是 1M 上下文窗口。按上轮用量预测，首轮未校准，可能超出软阈值。",
             },
         },
         "required": [],
@@ -981,6 +1101,7 @@ def _run_tools_call(params: dict, resume_state=None, resume_items=None, record_d
             input_budget=args.get("input_budget", DEFAULT_INPUT_BUDGET),
             project_settings=settings, contract=contract, record_dir=record_dir,
             host_packet=host_packet, resume_state=resume_state, resume_items=resume_items,
+            task_id=args.get('task_id'),
         )
     # 只保存最终报告与用量，不保存提示词、API 密钥或 reasoning 文本。
     artifact = None
@@ -1015,12 +1136,19 @@ def _run_tools_call(params: dict, resume_state=None, resume_items=None, record_d
     if receipt_path.exists():
         footer += f"\n执行记录：{receipt_path}"
     log(f"done status={stats['status']} steps={stats['steps']} elapsed={stats['elapsed_sec']}s")
+    handoff_path = record_dir / 'handoff.json'
+    state.atomic_json(handoff_path, workflow.handoff(stats, report))
+    followup_path = record_dir / 'followup.json'
     return {"content": [{"type": "text", "text": _clip(report, MAX_FINAL_CHARS) + footer}],
             "isError": stats["status"] != "completed",
             'structuredContent': {'status': stats['status'], 'server_version': SERVER_VERSION,
                 'model': model, 'effort': effort, 'report_path': str(artifact) if artifact else None,
                 'receipt_path': str(receipt_path) if receipt_path.exists() else None,
+                'handoff_path': str(handoff_path),
+                'followup_checkpoint': project.pin(followup_path) if followup_path.exists() else None,
                 'controller_acceptance_required': True, 'host_request': stats.get('host_request'),
+                'completion': stats.get('completion'), 'local_verification': stats.get('local_verification'),
+                'diagnostic': stats.get('diagnostic'),
                 'progress': stats.get('progress'), 'budgets': stats.get('budgets'),
                 'task_id': args.get('task_id'), 'acceptance_checks': stats.get('acceptance_checks', [])}}
 
@@ -1059,7 +1187,7 @@ def handle_tools_call(params: dict, _async_worker=False) -> dict:
                 return routed
         except (OSError, ValueError, TypeError, KeyError) as exc:
             return _error(str(exc), 'async_error')
-    if action not in ('run', 'status', 'claim', 'resume', 'native_request', 'native_result'):
+    if action not in ('run', 'status', 'claim', 'resume', 'followup', 'native_request', 'native_result'):
         return _error('Unknown action')
     task_id = args.get('task_id')
     if not task_id:
@@ -1129,6 +1257,51 @@ def handle_tools_call(params: dict, _async_worker=False) -> dict:
                     state.atomic_json(record_dir / 'receipt.json', {'task_id': task_id, 'status': 'preparing'})
                     with wall_deadline(args.get('timeout_sec', HARD_TIMEOUT)):
                         result = _run_tools_call(params, record_dir_override=record_dir)
+            elif action == 'followup':
+                if set(args) != {'action', 'task_id', 'followup_id', 'instruction'}:
+                    return _error('followup only accepts task_id, followup_id and instruction')
+                followup_id, text = workflow.instruction(args, 'followup_id')
+                fingerprint = state.digest(args)
+                previous = (journal or {}).get('followups', {}).get(followup_id)
+                if previous:
+                    if previous['fingerprint'] != fingerprint:
+                        return _error('followup_id already belongs to different instructions', 'task_conflict')
+                    if previous.get('result'):
+                        return previous['result']
+                    return _error('Followup outcome unknown; inspect evidence, do not repeat', 'outcome_unknown')
+                continuation = workflow.load_followup(journal)
+                original = dict(journal['arguments'])
+                original.update(model=continuation['stats']['model'], effort=continuation['stats']['effort'],
+                                cwd=continuation['stats'].get('cwd', original.get('cwd') or os.getcwd()))
+                # Explicitly freeze all effective budgets (including project
+                # defaults); a continuation never creates a fresh allowance.
+                original.update({k: v for k, v in continuation['stats']['budgets'].items()
+                                 if k in ('max_steps', 'timeout_sec', 'max_output_tokens', 'output_budget', 'input_budget')})
+                cwd = str(Path(original.get('cwd') or os.getcwd()).resolve())
+                if continuation['stats'].get('cwd', cwd) != cwd:
+                    return _error('Followup cwd changed since the original task')
+                settings, settings_pin = project.project_config(cwd)
+                contract = project.load_contract(original.get('contract_path'), cwd)
+                if settings_pin != continuation['stats']['project_config'] or (contract['pin'] if contract else None) != continuation['stats']['task_contract']:
+                    return _error('Project/contract changed; followup cannot change original constraints')
+                if continuation['stats'].get('permission_scopes') != (state.digest(contract['scopes']) if contract else None):
+                    return _error('Permission scopes changed since the checkpoint')
+                for pin in [continuation['host_packet'].get('pin')] + continuation['host_packet'].get('images', []):
+                    if pin and project.pin(pin['path']) != pin:
+                        return _error('Pinned host context/image changed; inspect evidence')
+                record_dir = Path(journal['receipt_path']).parent
+                archive = directory / 'followups' / state.digest(followup_id)
+                state.atomic_json(archive / 'prior_receipt.json', state.read(journal['receipt_path']))
+                state.atomic_json(archive / 'prior_result.json', journal.get('result'))
+                journal.setdefault('followups', {})[followup_id] = {'fingerprint': fingerprint, 'result': None}
+                journal.update(status='started_outcome_unknown', result=None)
+                state.atomic_json(journal_path, journal)
+                (record_dir / 'followup.json').unlink(missing_ok=True)
+                additions = [{'role': 'user', 'content': 'Controller acceptance feedback; continue the same task within original permissions, contract and remaining budgets:\n' + text}]
+                with wall_deadline(HARD_TIMEOUT):
+                    result = _run_tools_call({'name': TOOL_DEF['name'], 'arguments': original}, continuation, additions, record_dir)
+                result.setdefault('structuredContent', {})['followup_id'] = followup_id
+                journal['followups'][followup_id]['result'] = result
             elif action == 'resume':
                 if not journal or journal['status'] != 'needs_host':
                     return _error('Only needs_host tasks can resume; other outcomes require evidence review', 'not_resumable')
@@ -1139,7 +1312,11 @@ def handle_tools_call(params: dict, _async_worker=False) -> dict:
                 record_dir = Path(journal['receipt_path']).parent
                 continuation = state.read(record_dir / 'continuation.json')
                 if continuation is None: return _error('Missing continuation; inspect receipt', 'outcome_unknown')
-                original = journal['arguments']
+                original = dict(journal['arguments'])
+                original.update(model=continuation['stats']['model'], effort=continuation['stats']['effort'],
+                                cwd=continuation['stats'].get('cwd', original.get('cwd') or os.getcwd()))
+                original.update({k: v for k, v in continuation['stats']['budgets'].items()
+                                 if k in ('max_steps', 'timeout_sec', 'max_output_tokens', 'output_budget', 'input_budget')})
                 with wall_deadline(HARD_TIMEOUT):
                     cwd = str(Path(original.get('cwd') or os.getcwd()).resolve())
                     contract = project.load_contract(original.get('contract_path'), cwd)
@@ -1149,6 +1326,7 @@ def handle_tools_call(params: dict, _async_worker=False) -> dict:
                         return _error('Host action outcome is unknown; reconcile before resuming', 'host_outcome_unknown')
                     journal.update(status='started_outcome_unknown', result=None, host_result_source=source)
                     state.atomic_json(journal_path, journal)
+                    (record_dir / 'followup.json').unlink(missing_ok=True)
                     result = _run_tools_call({'name': TOOL_DEF['name'], 'arguments': original}, continuation, additions, record_dir)
             else:  # native_result
                 if not journal or journal['status'] != 'needs_native_agent':
