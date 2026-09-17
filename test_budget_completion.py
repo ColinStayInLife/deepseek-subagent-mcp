@@ -109,14 +109,14 @@ class BudgetCompletionTests(unittest.TestCase):
         self.assertEqual(result['structuredContent']['completion']['verification'], 'not_configured')
         self.assertEqual(result['structuredContent']['acceptance_checks'], [])
 
-    def test_unpaired_tools_and_unknown_writes_defer_checks(self):
+    def test_known_unexecuted_tools_can_check_but_unknown_writes_defer(self):
         contract = self.contract()
         self.api.side_effect = [response(calls=[('write_file', {'path': 'artifact.py', 'content': 'bad'})])]
-        with patch.object(p, 'acceptance_results', side_effect=AssertionError('Must not verify unresolved tools')) as check:
+        with patch.object(p, 'acceptance_results', wraps=p.acceptance_results) as check:
             result = self.start(contract_path=contract, allow_write=True, max_steps=1)
-            self.assertEqual(result['structuredContent']['completion']['verification'], 'deferred')
-            self.assertEqual(result['structuredContent']['local_verification']['reason'], 'unresolved_tool_or_host_action')
-            check.assert_not_called()
+            self.assertEqual(result['structuredContent']['completion']['verification'], 'failed')
+            self.assertEqual(result['structuredContent']['not_executed_calls'][0]['status'], 'not_executed')
+            check.assert_called_once()  # Missing artifact; the tool was certainly never dispatched.
         self.assertFalse((self.root/'artifact.py').exists())
         self.api.side_effect = [response(calls=[('write_file', {'path': 'artifact.py', 'content': 'bad'})])]
         with patch.object(s, 'dispatch', side_effect=s.DeadlineExceeded('during write')), \

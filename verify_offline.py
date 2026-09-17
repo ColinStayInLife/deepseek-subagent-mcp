@@ -31,7 +31,8 @@ def main():
     root = Path(__file__).resolve().parent
     os.chdir(root)
     modules = ['test_server', 'test_project_support', 'test_upgrade', 'test_async_jobs',
-               'test_execution_support', 'test_workflow_support', 'test_budget_completion', 'test_budget_settings']
+               'test_execution_support', 'test_workflow_support', 'test_budget_completion', 'test_budget_settings',
+               'test_contract_efficiency']
     stream = io.StringIO()
     environment = {'DEEPSEEK_API_BASE': 'http://127.0.0.1:9', 'DEEPSEEK_API_KEY': 'offline-test-only'}
     # Direct accidental API use fails before credentials/network. Subprocess

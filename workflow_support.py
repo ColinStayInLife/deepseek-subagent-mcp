@@ -180,6 +180,8 @@ def handoff(stats, report):
             'completion': stats.get('completion'),
             'local_verification': stats.get('local_verification'),
             'diagnostic': stats.get('diagnostic'),
+            'tool_budget': stats.get('tool_budget'),
+            'not_executed_calls': stats.get('not_executed_calls', []),
             'constraints': {'contract': stats.get('task_contract'), 'project': stats.get('project_config')},
             'usage': {k: stats.get(k) for k in ('steps', 'input_tokens', 'output_tokens', 'usage_complete', 'elapsed_sec')},
             'budgets': stats.get('budgets'), 'acceptance_checks': stats.get('acceptance_checks', []),
@@ -190,6 +192,18 @@ def handoff(stats, report):
                                  if x.get('tool') in {'read_file', 'json_query', 'file_info', 'grep', 'list_dir'}],
             'unresolved_actions': [{k: x.get(k) for k in ('sequence', 'tool', 'status', 'result_file')}
                                    for x in stats.get('action_records', []) if x.get('status') != 'returned']}
+
+
+def skip_unexecuted_calls(items, calls, stats, reason):
+    """Pair only calls the loop KNOWS it has not dispatched. Never repair an
+    interrupted/unknown action or malformed API output with a fake result.
+    """
+    for call in calls:
+        record = {'step': stats['steps'], 'call_id': call['call_id'], 'tool': call['name'],
+                  'status': 'not_executed', 'reason': reason}
+        stats.setdefault('not_executed_calls', []).append(record)
+        items.append({'type': 'function_call_output', 'call_id': call['call_id'],
+                      'output': 'NOT_EXECUTED: ' + reason + '; no tool was dispatched for this call.'})
 
 
 def verification_gate(status, items, stats, contract):
