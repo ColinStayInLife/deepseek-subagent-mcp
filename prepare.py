@@ -19,13 +19,20 @@ def canonical(path, cwd):
     return result + '/' if path.endswith('/') and result != '/' else result
 
 
+def directory_rules(draft, key, cwd):
+    values = draft.get(key, [])
+    if not isinstance(values, list) or not all(isinstance(x, str) and x for x in values):
+        raise ValueError(key + ' must be a list of directory paths')
+    return [str(project.resolve(x, cwd)).rstrip('/') + '/' for x in values]
+
+
 def build_contract(draft, cwd):
-    allowed = {'objective', 'acceptance', 'read_paths', 'write_paths', 'commands', 'pinned_read_paths', 'dependencies', 'checks', 'deliverables'}
+    allowed = {'objective', 'acceptance', 'read_paths', 'write_paths', 'read_dirs', 'write_dirs', 'commands', 'pinned_read_paths', 'dependencies', 'checks', 'deliverables'}
     if not isinstance(draft, dict) or set(draft) - allowed:
         raise ValueError('Unknown draft key')
     value = {'schema':'DEEPSEEK_TASK_V2', 'objective':draft['objective'], 'acceptance':draft['acceptance'],
-             'read_paths':[canonical(x,cwd) for x in draft['read_paths']],
-             'write_paths':[canonical(x,cwd) for x in draft.get('write_paths',[])],
+             'read_paths':[canonical(x,cwd) for x in draft.get('read_paths',[])] + directory_rules(draft, 'read_dirs', cwd),
+             'write_paths':[canonical(x,cwd) for x in draft.get('write_paths',[])] + directory_rules(draft, 'write_dirs', cwd),
              'commands':[], 'read_pins':[project.pin(project.resolve(x,cwd)) for x in draft.get('pinned_read_paths',[])],
              'dependencies':[canonical(x,cwd) for x in draft.get('dependencies',[])],
              'checks':[{**x,'path':canonical(x['path'],cwd)} for x in draft.get('checks',[])]}
@@ -53,6 +60,9 @@ def main():
     sub = parser.add_subparsers(dest='kind',required=True)
     contract = sub.add_parser('contract')
     contract.add_argument('--draft',type=Path,required=True)
+    check = sub.add_parser('check-contract', help='Validate an existing contract offline; never run a model or command')
+    check.add_argument('--contract', type=Path, required=True)
+    check.add_argument('--cwd', type=Path, default=Path.cwd())
     host = sub.add_parser('host')
     host.add_argument('--conversation',type=Path)
     host.add_argument('--capabilities',type=Path)
@@ -73,6 +83,20 @@ def main():
         child.add_argument('--output',type=Path,required=True)
     args = parser.parse_args()
     cwd = str(args.cwd.resolve())
+    if args.kind == 'check-contract':
+        try:
+            loaded = project.load_contract(args.contract, cwd)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            print(json.dumps({'status': 'invalid', 'error': str(exc), 'model_calls': 0,
+                              'commands_run': 0}, ensure_ascii=False))
+            return 2
+        scopes = {key: [{'path': path, 'recursive': recursive, 'exists': Path(path).exists()}
+                        for path, recursive in loaded['scopes'][key]] for key in ('read_paths', 'write_paths')}
+        print(json.dumps({'status': 'valid', 'contract': loaded['pin'], 'scopes': scopes,
+                          'missing_read_paths': [x['path'] for x in scopes['read_paths'] if not x['exists']],
+                          'model_calls': 0, 'commands_run': 0,
+                          'note': 'Scope/pin validation only; no task acceptance or command execution.'}, ensure_ascii=False))
+        return 0
     if args.output.exists(): parser.error('Output already exists; keep the existing evidence version')
     if args.kind == 'contract':
         value = build_contract(project.read_json(args.draft),cwd)
@@ -102,4 +126,4 @@ def main():
     print(json.dumps(project.pin(args.output),ensure_ascii=False))
 
 
-if __name__ == '__main__': main()
+if __name__ == '__main__': raise SystemExit(main())

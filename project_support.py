@@ -107,6 +107,18 @@ def load_contract(path, cwd):
             raise ValueError('Invalid contract ' + key)
     if not value['acceptance'] or not value['read_paths']:
         raise ValueError('Contract needs acceptance criteria and readable paths')
+    # A bare directory previously authorized listing/rg at its root while
+    # refusing every child read. Reject the ambiguous scope before any API call;
+    # never silently expand a file rule into recursive directory permission.
+    for key in ('read_paths', 'write_paths'):
+        for spec in value[key]:
+            target = resolve(spec, cwd)
+            if target.is_dir() and not spec.endswith('/'):
+                raise ValueError(f'{key}: directory scope must end with /: {spec}. '
+                                 'Explicitly use a trailing / or enumerate authorized files; '
+                                 'prepare.py draft also accepts read_dirs/write_dirs.')
+            if spec.endswith('/') and target.exists() and not target.is_dir():
+                raise ValueError(f'{key}: directory scope points to a non-directory: {spec}')
     if not isinstance(value['commands'], list) or len(value['commands']) > 20:
         raise ValueError('Invalid contract command inventory')
     ids = set()
@@ -197,6 +209,11 @@ def check_access(name, args, cwd, contract):
     if not allowed(key):
         raise ValueError(f'{name} path outside explicit {key}: {path}. '
                          'Use the exact paths in the contract; a permitted file does not authorize its parent directory.')
+    if name in ('grep', 'list_dir') and path.is_dir() and not any(
+            directory and path.is_relative_to(root) for root, directory in contract['scopes']['read_paths']):
+        # Also covers a path that was missing/a file at contract load and later
+        # became a directory. File permission must not turn into tree access.
+        raise ValueError(f'{name} requires an explicit directory scope ending with /: {path}')
     if name == 'edit_file' and not allowed('read_paths'):
         raise ValueError('edit_file also requires read access')
     for source in value.get('read_pins', []):
@@ -208,6 +225,17 @@ def verify_read(identity, contract):
     for source in (contract or {}).get('value', {}).get('read_pins', []):
         if identity['path'] == source['path'] and identity != source:
             raise ValueError('Read snapshot does not match pinned evidence')
+
+
+def verify_search_pins(root, contract):
+    """Search must not bypass immutable inputs that read_file would reject."""
+    root = Path(root).resolve()
+    for source in (contract or {}).get('value', {}).get('read_pins', []):
+        path = Path(source['path'])
+        if path == root or (root.is_dir() and path.is_relative_to(root)):
+            check_access('read_file', {'path': str(path)}, contract['cwd'], contract)
+            if pin(path) != source:
+                raise ValueError('Pinned search evidence changed: ' + str(path))
 
 
 def acceptance_results(contract, cwd):

@@ -287,7 +287,7 @@ def snapshot(root, args):
             summary['execution'] = {k: receipt[k] for k in (
                 'server_version', 'steps', 'tool_calls', 'input_tokens', 'output_tokens',
                 'reasoning_tokens', 'usage_complete', 'progress', 'duplicate_read_chars_avoided',
-                'completion', 'local_verification', 'diagnostic') if k in receipt}
+                'completion', 'local_verification', 'diagnostic', 'tool_budget') if k in receipt}
         if args.get('batch_id') and summary['result']:
             summary['result'] = {k: v for k, v in summary['result'].items() if k != 'content'}
         summaries.append(summary)

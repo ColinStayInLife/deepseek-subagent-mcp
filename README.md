@@ -2,7 +2,7 @@
 
 An opt-in MCP server for delegating bounded tasks to DeepSeek agents, with a durable background queue, evidence tracking, and explicit host-tool handoffs.
 
-Version: **1.7.0**. Python standard library only. Designed for Linux: process identity, file locks, signals, and cancellation use Linux facilities. Use a recent Python 3 release (3.10+ syntax; tested locally with Python 3.13).
+Version: **1.7.1**. Python standard library only. Designed for Linux: process identity, file locks, signals, and cancellation use Linux facilities. Use a recent Python 3 release (3.10+ syntax; tested locally with Python 3.13).
 
 ## 功能
 
@@ -12,6 +12,37 @@ Version: **1.7.0**. Python standard library only. Designed for Linux: process id
 - 文件 SHA 快照、明确的读写契约、固定命令、验收检查及执行记录。
 - 显式传递必要会话材料和带 SHA 的图片；浏览器/连接器请求交回主控执行。
 - 可准备宿主原生代理委派，但实际启动、可用模型、工具和计费由宿主决定。
+
+## v1.7.1：统一目录权限，改善工具预算收尾
+
+目录契约缺少末尾 `/` 时，旧版可能拒绝子文件读取，却允许目录搜索。新版在启动模型前拒绝这种歧义规则，并统一读取、列表和搜索的范围检查。文件规则后来变成目录，也不能自动获得递归访问权限。
+
+- 契约草稿新增 `read_dirs/write_dirs`，显式生成带 `/` 的目录规则；`read_paths/write_paths` 保留原有精确语义。文件后误加 `/` 也会被拒绝。
+- `prepare.py check-contract` 离线检查契约、范围和 SHA，列出尚不存在的读取路径；不执行命令或模型，也不代表任务验收通过。
+- `grep` 在搜索前后核对固定证据 SHA；修复没有 `rg` 时的单文件搜索，目录搜索不跟随子项符号链接。
+- `list_dir` 支持 `offset/limit`，默认每页最多 80 项、可设最多 200 项，按输出预算返回完整条目和 `next_offset`；分页不是文件系统事务快照。
+- 每轮显示剩余工具数，使用 38/40 次后，下一轮在剩余轮数、token 和时间内转为只报告。预算不足时保留本地交接；不会额外调用模型补收尾，`tool_limit` 也不会因拿到报告变成 `completed`。
+- 一批调用超过上限时，仅执行预算内的前缀，确定未派发的尾部记录为 `not_executed` 并补齐调用配对，使已有产物可进入只读契约检查。执行中断或副作用未知仍保持未知状态。`receipt/handoff/structuredContent` 提供工具预算和未执行清单，后台状态显示剩余工具数。
+
+示例草稿：
+
+```json
+{
+  "objective": "审查指定模块和验收证据",
+  "acceptance": ["结论附实际证据和未确定项"],
+  "read_paths": ["spec.md"],
+  "read_dirs": ["src", "results"],
+  "write_paths": [],
+  "commands": []
+}
+```
+
+```bash
+python3 prepare.py contract --draft draft.json --cwd /absolute/project --output contract.json
+python3 prepare.py check-contract --contract contract.json --cwd /absolute/project
+```
+
+更新后重新连接 MCP。旧契约和旧任务不自动修改、增加预算或重跑；目录规则不合要求时，由主控按原授权明确修订。Flash max、v1.7 token 预算和默认 3 个并发保持不变。路径检查属于工具层约束，不能替代操作系统沙箱。离线测试验证这些机制，实际完成率、耗时及费用改善尚未通过付费对照测量。
 
 ## v1.7 更新：给 Flash max 留足实现和验证预算
 
@@ -278,7 +309,7 @@ python3 prepare.py contract --cwd /absolute/project --draft draft.json --output 
 ## 离线验证
 
 ```bash
-python3 -m unittest -v test_server.py test_project_support.py test_upgrade.py test_async_jobs.py test_execution_support.py test_workflow_support.py test_budget_completion.py test_public_config.py
+python3 -m unittest -v test_server.py test_project_support.py test_upgrade.py test_async_jobs.py test_execution_support.py test_workflow_support.py test_budget_completion.py test_budget_settings.py test_contract_efficiency.py test_public_config.py
 ```
 
 模型响应均由离线 fixture 替代，并发测试使用真实本地进程和文件锁。测试不需要 API key，不进行付费模型、真实浏览器或连接器调用。
