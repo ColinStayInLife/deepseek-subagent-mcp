@@ -12,11 +12,12 @@ import tempfile
 
 import host_bridge as bridge
 import project_support as project
+import platform_support as platform
 
 
 def canonical(path, cwd):
     result = str(project.resolve(path, cwd))
-    return result + '/' if path.endswith('/') and result != '/' else result
+    return result + '/' if project.directory_spec(path) and result != '/' else result
 
 
 def directory_rules(draft, key, cwd):
@@ -109,21 +110,23 @@ def main():
             path = Path(directory)/'host.json'; path.write_text(json.dumps(value))
             bridge.load_packet(path,cwd)
     elif args.kind == 'host-result':
-        value = {'request_id':args.request_id,'status':args.status,'text':args.text_file.read_text(),
+        value = {'request_id':args.request_id,'status':args.status,'text':args.text_file.read_text(encoding='utf-8'),
                  'sources':project.read_json(args.sources) if args.sources else [],
                  'images':[project.pin(project.resolve(x,cwd)) for x in args.image]}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/'result.json'; path.write_text(json.dumps(value))
             bridge.result_packet(path,{'request_id':args.request_id,'call_id':'validate-packet'},cwd)
     else:
-        value = {'agent_id':args.agent_id,'execution_status':args.status,'text':args.text_file.read_text(),
+        value = {'agent_id':args.agent_id,'execution_status':args.status,'text':args.text_file.read_text(encoding='utf-8'),
                  'evidence':[project.pin(project.resolve(x,cwd)) for x in args.evidence]}
     args.output.parent.mkdir(parents=True,exist_ok=True)
     with args.output.open('x',encoding='utf-8') as stream:
-        os.fchmod(stream.fileno(),0o600)
+        platform.private_file(args.output)
         json.dump(value,stream,ensure_ascii=False,indent=2)
         stream.flush();os.fsync(stream.fileno())
     print(json.dumps(project.pin(args.output),ensure_ascii=False))
 
 
-if __name__ == '__main__': raise SystemExit(main())
+if __name__ == '__main__':
+    platform.configure_stdio()
+    raise SystemExit(main())

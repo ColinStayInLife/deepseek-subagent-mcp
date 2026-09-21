@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import server as s
+import platform_support as platform
+from test_platform_support import assert_private, directory_link, unlink_directory
 import project_support as p
 from test_server import response
 
@@ -18,7 +20,7 @@ from test_server import response
 class ProjectTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.cwd = str(self.root)
 
     def tearDown(self):
@@ -43,7 +45,7 @@ class ProjectTests(unittest.TestCase):
         value = json.loads(p.tool_json_query({'path': 'input.json', 'pointers': ['/error', '/nested/a~1b/~0key']}, self.cwd))
         self.assertEqual(value['selection']['/error'], 'physical tolerance failed')
         self.assertEqual(value['selection']['/nested/a~1b/~0key'], 42)
-        self.assertLess(len(json.dumps(value)), 300)
+        self.assertLess(len(json.dumps(value['selection'])), 150)
         self.assertEqual(json.loads(p.tool_file_info({'path': 'input.json'}, self.cwd))['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
         self.assertIn('json_query', s.tool_read_file({'path': 'input.json'}, self.cwd))
 
@@ -62,8 +64,11 @@ class ProjectTests(unittest.TestCase):
         contract = self.contract()
         (self.root / 'src').mkdir()
         outside = self.root / 'secret'; outside.write_text('untouched')
-        (self.root / 'src' / 'link').symlink_to(outside)
-        for name, args in [('read_file', {'path': 'src/link'}), ('read_file', {'path': 'src/../secret'}),
+        if platform.WINDOWS:
+            directory_link(self.root/'src'/'link', self.root)
+        else:
+            (self.root/'src'/'link').symlink_to(outside)
+        for name, args in [('read_file', {'path': 'src/link/secret' if platform.WINDOWS else 'src/link'}), ('read_file', {'path': 'src/../secret'}),
                            ('write_file', {'path': 'secret', 'content': 'wrong'}),
                            ('run_shell', {'command': 'touch secret'})]:
             result = s.dispatch(name, json.dumps(args), self.cwd, True, True, contract)

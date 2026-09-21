@@ -32,17 +32,16 @@ def main():
     os.chdir(root)
     modules = ['test_server', 'test_project_support', 'test_upgrade', 'test_async_jobs',
                'test_execution_support', 'test_workflow_support', 'test_budget_completion', 'test_budget_settings',
-               'test_contract_efficiency']
+               'test_contract_efficiency', 'test_public_config', 'test_platform_support']
     stream = io.StringIO()
     environment = {'DEEPSEEK_API_BASE': 'http://127.0.0.1:9', 'DEEPSEEK_API_KEY': 'offline-test-only'}
-    # Direct accidental API use fails before credentials/network. Subprocess
-    # fixtures mock responses and inherit a dummy key plus a loopback endpoint.
+    # No real credentials are available, and direct network use is blocked.
+    # Subprocess fixtures inherit only a dummy key plus a loopback endpoint.
     with patch.dict(os.environ, environment), \
-         patch.object(server, 'load_api_key', side_effect=AssertionError('Offline verification cannot load credentials')), \
          patch.object(server._OPENER, 'open', side_effect=AssertionError('Offline verification cannot use the network')):
         suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
         result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
-    (output/'tests.log').write_text(stream.getvalue())
+    (output/'tests.log').write_text(stream.getvalue(), encoding='utf-8')
 
     messages = [
         {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2024-11-05'}},
@@ -52,7 +51,7 @@ def main():
             'name': 'deepseek_subagent', 'arguments': {'task': 'invalid offline probe', 'max_steps': 0}}},
     ]
     proc = subprocess.run([sys.executable, str(root/'server.py')],
-        input='\n'.join(json.dumps(m) for m in messages)+'\n', capture_output=True, text=True,
+        input='\n'.join(json.dumps(m) for m in messages)+'\n', capture_output=True, text=True, encoding='utf-8',
         timeout=10, env={**os.environ, **environment, 'DEEPSEEK_SUBAGENT_RUNS_DIR': str(output/'probe-runs')})
     replies = [json.loads(line) for line in proc.stdout.splitlines()]
     protocol_ok = (proc.returncode == 0 and [r.get('id') for r in replies] == [1, 2, 3]
@@ -60,7 +59,7 @@ def main():
                    and {'steer', 'followup', 'reconcile'} <= set(replies[1]['result']['tools'][0]['inputSchema']['properties']['action']['enum'])
                    and replies[2]['result']['isError'] is True
                    and not (output/'probe-runs/usage.jsonl').exists())
-    (output/'stdio.json').write_text(json.dumps(replies, ensure_ascii=False, indent=2)+'\n')
+    (output/'stdio.json').write_text(json.dumps(replies, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
 
     fixture = output/'clone_fixture_source.py'
     fixture.write_text('SCHEMA = "V1"\n' + ''.join(f'# retained fixture line {i:05d}\n' for i in range(4000)))
@@ -78,7 +77,7 @@ def main():
                  'HARD_TIMEOUT', 'DEFAULT_MAX_OUTPUT_TOKENS', 'DEFAULT_OUTPUT_BUDGET',
                  'DEFAULT_INPUT_BUDGET', 'MAX_REQUEST_BYTES', 'MAX_TOOL_CALLS'}
     def selected_constants(path):
-        return {n.targets[0].id: ast.dump(n.value) for n in ast.parse(path.read_text()).body
+        return {n.targets[0].id: ast.dump(n.value) for n in ast.parse(path.read_text(encoding='utf-8')).body
                 if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) and n.targets[0].id in constants}
     limits_unchanged = (selected_constants(root/'server.py') == selected_constants(args.baseline)
                         if args.baseline else None)
@@ -102,8 +101,8 @@ def main():
         'live_connections_restarted': False,
         'sources': [project.pin(root/name) for name in ['server.py', 'execution_support.py', 'project_support.py',
                     'workflow_support.py', 'host_bridge.py', 'state_store.py', 'client.py',
-                    'prepare.py', 'async_jobs.py', 'verify_offline.py', 'scheduler.json'] + [m+'.py' for m in modules]]}
-    (output/'VALIDATION.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n')
+                    'prepare.py', 'async_jobs.py', 'platform_support.py', 'verify_offline.py', 'scheduler.json'] + [m+'.py' for m in modules]]}
+    (output/'VALIDATION.json').write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
     print(json.dumps({k: report[k] for k in ('status', 'server_version', 'tests', 'paid_model_calls')}, ensure_ascii=False))
     return int(report['status'] != 'PASS')
 

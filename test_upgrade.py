@@ -16,6 +16,8 @@ import client
 import host_bridge as b
 import project_support as p
 import server as s
+import platform_support as platform
+from test_platform_support import assert_private, directory_link, unlink_directory
 import state_store as store
 import prepare
 from test_server import response
@@ -24,7 +26,7 @@ from test_server import response
 class UpgradeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.runs = self.root / 'runs'
         self.cwd = str(self.root)
         self.addCleanup(self.temp.cleanup)
@@ -189,7 +191,10 @@ class UpgradeTests(unittest.TestCase):
     def test_grep_fallback_does_not_follow_file_symlink(self):
         outside = self.write('outside', 'MARKER')
         (self.root/'allowed').mkdir()
-        (self.root/'allowed/link').symlink_to(outside)
+        if platform.WINDOWS:
+            directory_link(self.root/'allowed/link', self.root)
+        else:
+            (self.root/'allowed/link').symlink_to(outside)
         contract = self.contract(read_paths=['allowed/'])
         with patch.object(s.shutil, 'which', return_value=None):
             result = s.dispatch('grep', json.dumps({'path':'allowed','pattern':'MARKER'}), self.cwd, False, False, contract)
@@ -197,9 +202,9 @@ class UpgradeTests(unittest.TestCase):
 
     def test_contract_scope_does_not_move_when_symlink_is_retargeted(self):
         (self.root/'original').mkdir(); (self.root/'other').mkdir()
-        link = self.root/'alias'; link.symlink_to(self.root/'original', target_is_directory=True)
+        link = self.root/'alias'; directory_link(link, self.root/'original')
         contract = self.contract(read_paths=['alias/'])
-        link.unlink(); link.symlink_to(self.root/'other', target_is_directory=True)
+        unlink_directory(link); directory_link(link, self.root/'other')
         with self.assertRaises(ValueError): p.check_access('read_file', {'path':'alias/file'}, self.cwd, contract)
 
     def test_acceptance_check_prevents_false_completed(self):
@@ -312,7 +317,7 @@ class UpgradeTests(unittest.TestCase):
     def test_private_continuation_not_in_status_response(self):
         start = self.host_start()
         continuation = Path(start['structuredContent']['receipt_path']).parent/'continuation.json'
-        self.assertEqual(continuation.stat().st_mode & 0o777, 0o600)
+        assert_private(self, continuation)
         status = self.call(action='status', task_id='host-task')
         self.assertNotIn('Example project context', json.dumps(status))
 
@@ -345,9 +350,9 @@ class UpgradeTests(unittest.TestCase):
         start = time.monotonic()
         with self.assertRaises(s.DeadlineExceeded):
             with s.wall_deadline(.03):
-                with s.wall_deadline(10): time.sleep(.1)
+                with s.wall_deadline(10): platform.sleep(.1)
         self.assertLess(time.monotonic()-start, .09)
-        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+        self.assertEqual(getattr(platform._local, 'deadlines', []) if platform.WINDOWS else signal.getitimer(signal.ITIMER_REAL)[0], [] if platform.WINDOWS else 0)
 
     def test_stale_report_for_previous_candidate_fails_acceptance(self):
         candidate = self.write('candidate.py', 'original')

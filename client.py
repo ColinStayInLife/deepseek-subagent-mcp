@@ -12,6 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 import state_store as state
+import platform_support as platform
 from server import HARD_TIMEOUT
 
 CLIENT_TIMEOUT = HARD_TIMEOUT + 60
@@ -24,7 +25,7 @@ def main():
     args = parser.parse_args()
     if args.result.exists():
         parser.error('Result file already exists; inspect the prior attempt instead of overwriting it')
-    arguments = json.loads(args.arguments.read_text())
+    arguments = json.loads(args.arguments.read_text(encoding='utf-8'))
     if not isinstance(arguments, dict): parser.error('Arguments must be a JSON object')
     if arguments.get('action', 'run') in ('run', 'submit', 'native_request'):
         arguments.setdefault('task_id', 'client-' + state.digest(arguments)[:32])
@@ -36,7 +37,7 @@ def main():
              'arguments_sha256': state.digest(arguments),
              'instruction': 'Inspect server task status/receipt; do not blindly rerun.'}
     with args.result.open('x', encoding='utf-8') as stream:
-        os.fchmod(stream.fileno(), 0o600)
+        platform.private_file(args.result)
         json.dump(claim, stream, ensure_ascii=False)
         stream.flush(); os.fsync(stream.fileno())
     messages = [
@@ -47,10 +48,14 @@ def main():
     ]
     proc = subprocess.Popen([sys.executable, str(Path(__file__).with_name('server.py'))],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True)
+                            text=True, encoding='utf-8', **platform.process_options())
     try:
         stdout, stderr = proc.communicate('\n'.join(json.dumps(x, ensure_ascii=False) for x in messages) + '\n', timeout=CLIENT_TIMEOUT)
     except BaseException:
+        if platform.WINDOWS:
+            platform.kill_process_group(proc)
+            proc.communicate()
+            raise
         # The server owns its command groups. SIGTERM first interrupts Python
         # so its finally blocks clean them; SIGKILL is only the final fallback.
         try: os.killpg(proc.pid, signal.SIGTERM)
@@ -75,4 +80,6 @@ def main():
     return int(result['result'].get('isError', False))
 
 
-if __name__ == '__main__': sys.exit(main())
+if __name__ == '__main__':
+    platform.configure_stdio()
+    sys.exit(main())

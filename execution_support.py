@@ -10,6 +10,7 @@ import re
 import tempfile
 
 import project_support as project
+import platform_support as platform
 
 MUTATIONS = frozenset(('write_file', 'edit_file', 'clone_file'))
 READS = frozenset(('read_file', 'json_query', 'file_info'))
@@ -65,6 +66,7 @@ def clone_file(args, cwd, contract=None):
     try:
         fd, temporary = tempfile.mkstemp(prefix='.deepseek-clone-', dir=target.parent)
         with os.fdopen(fd, 'wb') as stream:
+            platform.private_file(temporary)
             stream.write(output)
             stream.flush()
             os.fsync(stream.fileno())

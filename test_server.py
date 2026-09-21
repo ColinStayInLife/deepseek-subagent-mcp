@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import server as s
+import platform_support as platform
+from test_platform_support import assert_private, directory_link, unlink_directory
 
 
 def response(text=None, calls=(), status="completed", tokens=20):
@@ -119,7 +121,7 @@ class AgentTests(unittest.TestCase):
             _, stats = s.run_subagent(**self.kw)
         self.assertEqual(stats["status"], "timeout")
         self.assertFalse(stats["usage_complete"])
-        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+        self.assertEqual(getattr(platform._local, 'deadlines', []) if platform.WINDOWS else signal.getitimer(signal.ITIMER_REAL)[0], [] if platform.WINDOWS else 0)
 
     def test_readonly_and_exact_edit(self):
         names = [x["name"] for x in s.tool_schemas(False, False)]
@@ -164,7 +166,15 @@ class AgentTests(unittest.TestCase):
 
     def test_shell_timeout_kills_descendants(self):
         marker = Path(self.cwd, "late")
-        result = s.tool_run_shell({"command": "(sleep 2; touch late) & wait", "timeout_sec": 1}, self.cwd)
+        child = "import time,pathlib;time.sleep(2);pathlib.Path('late').touch()"
+        script = Path(self.cwd)/'spawn.py'
+        script.write_text('import subprocess,sys,time\nsubprocess.Popen([sys.executable,"-c",' + repr(child) + '])\ntime.sleep(30)', encoding='utf-8')
+        if platform.WINDOWS:
+            command = "& '" + sys.executable.replace("'", "''") + "' '" + str(script).replace("'", "''") + "'"
+        else:
+            import shlex
+            command = shlex.join([sys.executable, str(script)])
+        result = s.tool_run_shell({"command": command, "timeout_sec": 1}, self.cwd)
         self.assertIn("超时", result)
         time.sleep(1.2)
         self.assertFalse(marker.exists())

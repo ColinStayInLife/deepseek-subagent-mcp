@@ -10,6 +10,8 @@ import execution_support as e
 import prepare
 import project_support as p
 import server as s
+import platform_support as platform
+from test_platform_support import assert_private, directory_link, unlink_directory
 from test_server import response
 
 
@@ -17,7 +19,7 @@ class ExecutionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.cwd = str(self.root)
         self.api = patch.object(s, 'call_responses', side_effect=AssertionError('Unexpected API request')).start()
         self.addCleanup(patch.stopall)
@@ -103,7 +105,14 @@ class ExecutionTests(unittest.TestCase):
         target = self.write('candidate.py', 'keep')
         self.assertTrue(self.dispatch_clone(args).startswith('错误：'))
         self.assertEqual(target.read_text(), 'keep')
-        target.unlink(); target.symlink_to(self.root/'outside.py')
+        target.unlink()
+        if platform.WINDOWS:
+            missing = self.root/'outside.py'
+            missing.mkdir()
+            directory_link(target, missing)
+            missing.rmdir()
+        else:
+            target.symlink_to(self.root/'outside.py')
         self.assertTrue(self.dispatch_clone(args).startswith('错误：'))
         self.assertFalse((self.root/'outside.py').exists())
 
@@ -130,7 +139,12 @@ class ExecutionTests(unittest.TestCase):
         original.rename(self.root/'outside.py')
         self.write('source.py', 'permitted')
         contract = self.contract()
-        original.unlink(); original.symlink_to(self.root/'outside.py')
+        original.unlink()
+        if platform.WINDOWS:
+            directory_link(self.root/'alias', self.root)
+            args['source_path'] = 'alias/outside.py'
+        else:
+            original.symlink_to(self.root/'outside.py')
         self.assertTrue(self.dispatch_clone(args, contract).startswith('错误：'))
         self.assertFalse((self.root/'candidate.py').exists())
 

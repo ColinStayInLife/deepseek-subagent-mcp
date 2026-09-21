@@ -18,6 +18,7 @@ import time
 import project_support as project
 import state_store as state
 import workflow_support as workflow
+import platform_support as platform
 
 ACTIVE = {'queued', 'running', 'cancel_requested'}
 RESERVED = ACTIVE | {'needs_host', 'outcome_unknown'}
@@ -73,13 +74,7 @@ def queue_lock(root):
     return acquire_lock(Path(root) / 'async' / 'queue.lock')
 
 
-def process_identity(pid):
-    try:
-        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
-        if fields[0] == 'Z': return None
-        return {'pid': pid, 'start_ticks': fields[19]}
-    except (OSError, IndexError):
-        return None
+process_identity = platform.process_identity
 
 
 def alive(job):
@@ -88,22 +83,7 @@ def alive(job):
 
 
 def signal_worker(job):
-    if not alive(job): return
-    if hasattr(os, 'pidfd_open'):
-        fd = os.pidfd_open(job['process']['pid'])
-    else:
-        # Some local Python builds omit os.pidfd_open although Linux/glibc
-        # provide it. Use the same kernel handle, never a bare recycled PID.
-        libc = ctypes.CDLL(None, use_errno=True)
-        open_fd = libc.pidfd_open
-        open_fd.argtypes = [ctypes.c_int, ctypes.c_uint]
-        open_fd.restype = ctypes.c_int
-        fd = open_fd(job['process']['pid'], 0)
-        if fd < 0: raise OSError(ctypes.get_errno(), 'pidfd_open failed')
-    try:
-        if alive(job): signal.pidfd_send_signal(fd, signal.SIGTERM)
-    finally:
-        os.close(fd)
+    if alive(job): platform.signal_worker(job['process'])
 
 
 def observed(job):
@@ -188,9 +168,9 @@ def launch(root, job):
     try:
         log_path = directory(root, job['task_id']) / 'worker.log'
         with log_path.open('ab') as stream:
-            os.chmod(log_path, 0o600)
+            platform.private_file(log_path)
             proc = subprocess.Popen(worker_command(root, job['task_id']), stdin=subprocess.DEVNULL,
-                                    stdout=stream, stderr=stream, start_new_session=True,
+                                    stdout=stream, stderr=stream, **platform.process_options(),
                                     env={**os.environ, 'DEEPSEEK_SUBAGENT_RUNS_DIR': str(Path(root).resolve())})
         job['process'] = process_identity(proc.pid)
         # The worker waits on queue.lock before acting. Losing this receipt is
@@ -487,7 +467,7 @@ def worker(root, task_id):
     import server
     server.RUNS_DIR = Path(root)
     target = job_path(root, task_id)
-    with acquire_lock(directory(root, task_id) / 'worker.lock'):
+    with acquire_lock(directory(root, task_id) / 'worker.lock'), platform.cancellation_scope():
         while True:
             with queue_lock(root):
                 job = state.read(target)
@@ -505,11 +485,7 @@ def worker(root, task_id):
                 active = sum(x['status'] in {'running', 'cancel_requested'} or (x['status'] == 'outcome_unknown' and alive(x)) for x in busy)
                 blockers = [x for x in busy if x['status'] in {'running', 'cancel_requested', 'needs_host', 'outcome_unknown'}]
                 if all(x['status'] == 'completed' for x in deps) and active < config()['max_workers'] and not any(conflicts(job, other) for other in blockers):
-                    # Install before committing running: cancel cannot hit the
-                    # gap before cleanup-aware signal handling is available.
-                    def stop(signum, frame):
-                        raise server.DeadlineExceeded('Async cancellation requested')
-                    signal.signal(signal.SIGTERM, stop)
+                    # cancellation_scope is ready before publishing running.
                     job.update(status='running', started_at=time.time())
                     state.atomic_json(target, job)
                     break
@@ -528,7 +504,7 @@ def worker(root, task_id):
             result = server._error(str(exc), 'outcome_unknown' if execution_started or isinstance(exc, server.DeadlineExceeded) else 'preflight_failed')
         # Once model execution stops, commit the outcome even if another cancel
         # arrives; do not lose the report between API completion and persistence.
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if not platform.WINDOWS: signal.signal(signal.SIGTERM, signal.SIG_IGN)
         with queue_lock(root):
             current = state.read(target)
             status = result_status(result)
@@ -545,6 +521,7 @@ def worker(root, task_id):
 
 
 if __name__ == '__main__':
+    platform.configure_stdio()
     if len(sys.argv) != 4 or sys.argv[1] != '--worker':
         raise SystemExit('Internal worker entry point; use MCP submit/batch to create jobs')
     worker(Path(sys.argv[2]), sys.argv[3])

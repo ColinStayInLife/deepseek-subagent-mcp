@@ -2,7 +2,7 @@
 
 An opt-in MCP server for delegating bounded tasks to DeepSeek agents, with a durable background queue, evidence tracking, and explicit host-tool handoffs.
 
-Version: **1.7.1**. Python standard library only. Designed for Linux: process identity, file locks, signals, and cancellation use Linux facilities. Use a recent Python 3 release (3.10+ syntax; tested locally with Python 3.13).
+Version: **1.7.1**. Python standard library only. Supports native Windows 10/11 and Linux with Python 3.10+. No WSL or third-party Python packages are required. Linux retains its original locks and signals; Windows uses native file locks, process creation times, cancellation events, and Job Objects.
 
 ## 功能
 
@@ -213,6 +213,38 @@ env_vars = ["DEEPSEEK_API_KEY"]
 startup_timeout_sec = 20
 tool_timeout_sec = 3650
 ```
+
+### Windows 原生安装
+
+在 PowerShell 中运行离线验证（不调用模型）：
+
+```powershell
+python -X utf8 .\verify_offline.py --output .\runs\windows-verification
+```
+
+输出目录必须是新的，避免覆盖旧验证记录。Codex 的 Windows 配置示例：
+
+```toml
+[mcp_servers.deepseek_subagent]
+command = 'C:\Python310\python.exe'
+args = ['-X', 'utf8', 'C:\tools\deepseek-subagent-mcp\server.py']
+cwd = 'C:\tools\deepseek-subagent-mcp'
+env_vars = ['DEEPSEEK_API_KEY']
+startup_timeout_sec = 20
+tool_timeout_sec = 3650
+```
+
+将上面的 Python 和仓库位置替换为实际绝对路径；TOML 单引号中的反斜杠无需双写，支持含空格及中文的路径。`DEEPSEEK_API_KEY` 必须由宿主环境安全提供，服务不会从其他应用的配置中提取密钥。环境变量修改后重启宿主。
+
+Windows 的 `run_shell` 使用 PowerShell（优先 `pwsh`，否则 `powershell`），命令内容必须使用对应语法。固定命令仍使用精确 `argv`，不经过 shell。目录契约支持 `/` 或 Windows 的 `\` 结尾。stdio 和状态文件使用 UTF-8。
+
+Windows 通过非阻塞字节锁防止重复执行，通过 PID + 创建时间识别进程。取消使用绑定该身份的命名事件；超时和取消会终止命令的完整 Job Object，包括已退出父进程留下的子进程。命令启动前先完成 Job Object 绑定；绑定失败时不执行命令。后台 worker 的生命周期独立于提交连接。
+
+Windows 没有 `SIGALRM`：网络等待和命令等待检查截止时间，文件读取/哈希在操作边界或数据块之间检查。单次操作系统文件调用不会被强行中断。已发送的 HTTP 请求可能仍在服务端处理；迟到响应会被丢弃，不执行其中的工具，费用保持未知且不自动重试。私有状态使用仅文件所有者和 SYSTEM 可访问的 DACL；数据先 flush/fsync 再原子替换，Windows 不承诺 POSIX 的目录 fsync 语义。建议使用当前账户的本地 NTFS 状态目录。
+
+Windows 离线测试用不需要管理员权限的 NTFS 目录联接验证重解析路径；Linux 使用符号链接。验证还覆盖跨进程锁、中文路径、后台并发、取消、断开连接、进程树清理及原有执行预算。
+
+实现依据：[Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)、[Python Windows 文件锁](https://docs.python.org/3/library/msvcrt.html)、[Codex MCP 配置](https://learn.chatgpt.com/docs/extend/mcp)。
 
 修改工具定义后重新连接 MCP。`AGENTS.md` 提供本仓库的开发约束和可移植的主控使用规则；需要其他工作目录也采用这些规则时，将相关规则加入对应宿主指令。
 

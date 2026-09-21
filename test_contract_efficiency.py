@@ -18,6 +18,8 @@ import project_support as project
 import server
 import state_store as state
 import workflow_support as workflow
+import platform_support as platform
+from test_platform_support import directory_link
 from test_server import response
 
 
@@ -26,7 +28,7 @@ class ContractEfficiencyTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(patch.stopall)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.cwd = str(self.root)
         patch.object(server, 'RUNS_DIR', self.root/'runs').start()
         patch.object(server, 'load_api_key', side_effect=AssertionError('No credentials')).start()
@@ -123,7 +125,12 @@ class ContractEfficiencyTests(unittest.TestCase):
         p = self.write('allowed/child.txt', 'original')
         outside = self.write('outside/secret.txt', 'PRIVATE')
         contract = project.load_contract(self.contract(read_pins=[project.pin(p)]), self.cwd)
-        p.unlink(); p.symlink_to(outside)
+        p.unlink()
+        if platform.WINDOWS:
+            p.parent.rmdir()
+            directory_link(p.parent, outside.parent)
+        else:
+            p.symlink_to(outside)
         original_pin = project.pin
         def guarded_pin(path):
             if Path(path).resolve() == outside:
@@ -154,8 +161,11 @@ class ContractEfficiencyTests(unittest.TestCase):
     def test_single_file_fallback_search_and_symlink_isolation(self):
         self.write('allowed/source.txt', 'MARKER\nother')
         secret = self.write('outside/secret.txt', 'SECRET_ONLY')
-        (self.root/'allowed/link').symlink_to(secret)
-        (self.root/'allowed/outside_dir').symlink_to(secret.parent, target_is_directory=True)
+        if platform.WINDOWS:
+            directory_link(self.root/'allowed/link', secret.parent)
+        else:
+            (self.root/'allowed/link').symlink_to(secret)
+        directory_link(self.root/'allowed/outside_dir', secret.parent)
         contract = project.load_contract(self.contract(), self.cwd)
         for binary in [None, shutil.which('rg')]:
             with self.subTest(binary=binary), patch.object(server.shutil, 'which', return_value=binary):

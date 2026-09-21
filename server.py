@@ -38,6 +38,8 @@ import state_store as state
 import host_bridge as bridge
 import execution_support as execution
 import workflow_support as workflow
+import platform_support as platform
+from platform_support import DeadlineExceeded, wall_deadline
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -80,28 +82,6 @@ def budget_defaults():
     return {'max_steps': DEFAULT_MAX_STEPS, 'timeout_sec': DEFAULT_TIMEOUT,
             'max_output_tokens': DEFAULT_MAX_OUTPUT_TOKENS,
             'output_budget': DEFAULT_OUTPUT_BUDGET, 'input_budget': DEFAULT_INPUT_BUDGET}
-
-
-class DeadlineExceeded(RuntimeError):
-    pass
-
-
-@contextmanager
-def wall_deadline(seconds: float):
-    """stdio server 串行执行；Linux 主线程用闹钟覆盖网络和工具的总时间。"""
-    def expired(signum, frame):
-        raise DeadlineExceeded("任务墙钟预算已耗尽")
-    prior_timer = signal.getitimer(signal.ITIMER_REAL)
-    entered = time.monotonic()
-    previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, min(seconds, prior_timer[0]) if prior_timer[0] else seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-        if prior_timer[0]:
-            signal.setitimer(signal.ITIMER_REAL, max(.000001, prior_timer[0] - (time.monotonic() - entered)), prior_timer[1])
 
 
 def log(*parts: Any) -> None:
@@ -238,18 +218,19 @@ def tool_grep(args: dict, cwd: str, contract=None) -> str:
                "--max-columns", "300", "--max-columns-preview",
                "-m", str(limit), "--", pattern, str(root)]
         # 限制总条数（rg -m 本身只限制每个文件）。
-        errors = tempfile.TemporaryFile(mode="w+t")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors,
-                                text=True, start_new_session=True)
+        errors = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+        proc = platform.popen_group(cmd, stdout=subprocess.PIPE, stderr=errors,
+                                    text=True, encoding="utf-8", errors="replace")
         try:
             hits = []
-            for line in proc.stdout:
+            for line in platform.iter_lines(proc.stdout):
+                platform.check_interrupt()
                 hits.append(line.rstrip())
                 if len(hits) >= limit or sum(map(len, hits)) >= MAX_TOOL_OUTPUT:
                     return _clip("\n".join(hits) + "\n[结果达到上限，请缩小范围]")
             errors.seek(0)
             error = errors.read(MAX_TOOL_OUTPUT)
-            if proc.wait() not in (0, 1):
+            if platform.wait_process(proc) not in (0, 1):
                 return _clip(f"错误：rg 搜索失败 {error}")
             return _clip("\n".join(hits) or "(无匹配)")
         finally:
@@ -266,7 +247,7 @@ def tool_grep(args: dict, cwd: str, contract=None) -> str:
     walk = [(root.parent, [], [root.name])] if root.is_file() else os.walk(root)
     for base, dirs, files in walk:
         dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__"}
-                   and not (Path(base) / d).is_symlink()]
+                   and not platform.is_reparse_link(Path(base) / d)]
         for name in files:
             fp = Path(base) / name
             try:
@@ -320,12 +301,7 @@ def tool_edit_file(args: dict, cwd: str) -> str:
     return f"已修改 {path}（唯一片段替换）"
 
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    proc.wait()
+_kill_process_group = platform.kill_process_group
 
 
 def tool_run_shell(args: dict, cwd: str) -> str:
@@ -338,13 +314,12 @@ def tool_run_shell(args: dict, cwd: str) -> str:
         workdir = cwd
     # 临时文件承接长日志，避免 capture_output 将全部日志放进内存。
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        proc = subprocess.Popen(
-            ["bash", "-lc", command], stdout=out, stderr=err, cwd=workdir,
-            start_new_session=True,
+        proc = platform.popen_group(
+            platform.shell_command(command), stdout=out, stderr=err, cwd=workdir,
             env={**os.environ, "GIT_PAGER": "cat", "PAGER": "cat"},
         )
         try:
-            proc.wait(timeout=timeout)
+            platform.wait_process(proc, timeout=timeout)
             status = f"exit_code: {proc.returncode}"
         except subprocess.TimeoutExpired:
             status = f"错误：命令超时（{timeout}s）"
@@ -411,7 +386,7 @@ def tool_schemas(allow_write: bool, allow_shell: bool) -> list[dict]:
         tools.append({
             "type": "function",
             "name": "run_shell",
-            "description": "在 bash 中执行命令并返回 stdout/stderr/exit_code。用于跑测试、git、构建等。",
+            "description": "在本机 shell（Windows: PowerShell；Linux: bash）中执行命令并返回 stdout/stderr/exit_code。用于跑测试、git、构建等。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -700,6 +675,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
             stats['deliverable_baseline'] = execution.deliverable_baseline(contract, cwd)
         checkpoint()
         for step in range(stats['steps'], max_steps):
+            platform.check_interrupt()
             if mailbox: workflow.append_updates(items, mailbox.poll(), stats)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -784,7 +760,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
             # 不自动重试：超时后的用量/副作用可能不确定。
             stats["usage_complete"] = False
             checkpoint()
-            resp = call_responses(payload, timeout=max(0.01, remaining))
+            resp = platform.network_call(call_responses, payload, timeout=max(0.01, remaining))
             usage = resp.get("usage") or {}
             stats["usage_complete"] = bool(usage)
             stats["input_tokens"] += int(usage.get("input_tokens") or 0)
@@ -865,6 +841,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
             for call_index, call in enumerate(calls):
                 if mailbox and workflow.append_updates(items, mailbox.poll(), stats, calls[call_index:]):
                     break
+                platform.check_interrupt()
                 if time.monotonic() >= deadline:
                     return finish("timeout", "工具执行前时间已耗尽")
                 if stats["tool_calls"] >= MAX_TOOL_CALLS:
@@ -920,7 +897,7 @@ def run_subagent(task: str, context: str, cwd: str, model: str, effort: str,
                     action_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                     result_file = action_dir / 'tool_result.txt'
                     with result_file.open('x', encoding='utf-8') as stream:
-                        result_file.chmod(0o600)
+                        platform.private_file(result_file)
                         stream.write(raw_result)
                     action['result_file'] = project.pin(result_file)
                     stats['evidence_files'].append(action['result_file'])
@@ -1144,7 +1121,7 @@ def _run_tools_call(params: dict, resume_state=None, resume_items=None, record_d
         RUNS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         artifact = RUNS_DIR / (run_id + ".md")
         with artifact.open("x", encoding="utf-8") as f:
-            artifact.chmod(0o600)
+            platform.private_file(artifact)
             f.write(report)
         metrics = {k: v for k, v in stats.items() if k not in ('actions', 'action_records', 'evidence_files', 'host_context', 'host_request')}
         for k in previous_usage:
@@ -1153,7 +1130,7 @@ def _run_tools_call(params: dict, resume_state=None, resume_items=None, record_d
         metrics.update({"run_id": run_id, "cwd": cwd, "report_path": str(artifact), 'receipt_path': str(record_dir / 'receipt.json')})
         metrics_path = RUNS_DIR / "usage.jsonl"
         with metrics_path.open("a", encoding="utf-8") as f:
-            metrics_path.chmod(0o600)
+            platform.private_file(metrics_path)
             f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
     except OSError as exc:
         log("报告或用量落盘失败:", type(exc).__name__)
@@ -1428,6 +1405,7 @@ def handle_request(method: str, params: dict, req_id: Any) -> dict | None:
 
 
 def main() -> int:
+    platform.configure_stdio()
     def terminate(signum, frame):
         raise DeadlineExceeded('Server terminated; inspect outcome before any retry')
     signal.signal(signal.SIGTERM, terminate)

@@ -12,6 +12,7 @@ import signal
 import subprocess
 from pathlib import Path
 import state_store as state
+import platform_support as platform
 
 CONFIG_NAME = '.deepseek-subagent.json'
 MAX_JSON_BYTES = 32 * 1024 * 1024
@@ -24,6 +25,7 @@ def read_json(path, limit=MAX_JSON_BYTES):
 
 def snapshot(path, limit=MAX_JSON_BYTES):
     """The returned bytes and SHA describe the SAME open file version."""
+    platform.check_interrupt()
     path = Path(path).resolve()
     with Path(path).open('rb') as stream:
         before = os.fstat(stream.fileno())
@@ -38,11 +40,13 @@ def snapshot(path, limit=MAX_JSON_BYTES):
 
 
 def pin(path):
+    platform.check_interrupt()
     path = Path(path).resolve()
     digest = hashlib.sha256()
     with path.open('rb') as stream:
         before = os.fstat(stream.fileno())
         for data in iter(lambda: stream.read(1024 * 1024), b''):
+            platform.check_interrupt()
             digest.update(data)
         observed = os.fstat(stream.fileno())
     after = path.stat()
@@ -80,10 +84,14 @@ def resolve(path, cwd):
     return (p if p.is_absolute() else Path(cwd) / p).resolve()
 
 
+def directory_spec(path):
+    return path.endswith('/') or (platform.WINDOWS and path.endswith('\\'))
+
+
 def within(path, specifications, cwd):
     for spec in specifications:
         target = resolve(spec, cwd)
-        if path == target or (spec.endswith('/') and path.is_relative_to(target)):
+        if path == target or (directory_spec(spec) and path.is_relative_to(target)):
             return True
     return False
 
@@ -113,11 +121,11 @@ def load_contract(path, cwd):
     for key in ('read_paths', 'write_paths'):
         for spec in value[key]:
             target = resolve(spec, cwd)
-            if target.is_dir() and not spec.endswith('/'):
+            if target.is_dir() and not directory_spec(spec):
                 raise ValueError(f'{key}: directory scope must end with /: {spec}. '
                                  'Explicitly use a trailing / or enumerate authorized files; '
                                  'prepare.py draft also accepts read_dirs/write_dirs.')
-            if spec.endswith('/') and target.exists() and not target.is_dir():
+            if directory_spec(spec) and target.exists() and not target.is_dir():
                 raise ValueError(f'{key}: directory scope points to a non-directory: {spec}')
     if not isinstance(value['commands'], list) or len(value['commands']) > 20:
         raise ValueError('Invalid contract command inventory')
@@ -169,7 +177,7 @@ def load_contract(path, cwd):
     for item in deliverables:
         if (not isinstance(item, dict) or set(item) != {'path', 'must_change'}
                 or not isinstance(item['path'], str) or not item['path']
-                or item['path'].endswith('/') or type(item['must_change']) is not bool
+                or directory_spec(item['path']) or type(item['must_change']) is not bool
                 or not within(resolve(item['path'], cwd), value['write_paths'], cwd)):
             raise ValueError('Deliverable needs a file path inside write_paths and boolean must_change')
         path_key = str(resolve(item['path'], cwd))
@@ -184,7 +192,7 @@ def load_contract(path, cwd):
         if check['id'] in check_ids: raise ValueError('Duplicate acceptance check ID')
         check_ids.add(check['id'])
     # Resolve allowed roots once. A later symlink replacement must not move them.
-    scopes = {k: [(str(resolve(x, cwd)), x.endswith('/')) for x in value[k]] for k in ('read_paths', 'write_paths')}
+    scopes = {k: [(str(resolve(x, cwd)), directory_spec(x)) for x in value[k]] for k in ('read_paths', 'write_paths')}
     return {'value': value, 'pin': identity, 'cwd': cwd, 'scopes': scopes}
 
 
@@ -241,6 +249,7 @@ def verify_search_pins(root, contract):
 def acceptance_results(contract, cwd):
     results = []
     for check in (contract or {}).get('value', {}).get('checks', []):
+        platform.check_interrupt()
         try:
             check_access('json_query', {'path': check['path']}, cwd, contract)
             data, source = snapshot(resolve(check['path'], cwd))
@@ -423,18 +432,14 @@ def _execute_command(cmd, name, action_dir, candidates):
     action_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     out_path, err_path = action_dir / 'stdout.log', action_dir / 'stderr.log'
     with out_path.open('xb') as stdout, err_path.open('xb') as stderr:
-        os.chmod(out_path, 0o600); os.chmod(err_path, 0o600)
-        proc = subprocess.Popen(cmd['argv'], cwd=cmd['cwd'], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+        platform.private_file(out_path); platform.private_file(err_path)
+        proc = platform.popen_group(cmd['argv'], cwd=cmd['cwd'], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
         try:
-            proc.wait(timeout=cmd['timeout_sec'])
+            platform.wait_process(proc, timeout=cmd['timeout_sec'])
         except subprocess.TimeoutExpired:
             raise RuntimeError('Approved command timeout; inspect saved logs before any further run')
         finally:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+            platform.kill_process_group(proc)
     result = {'id': name, 'exit_code': proc.returncode, 'stdout': pin(out_path), 'stderr': pin(err_path), 'candidates': candidates}
     if any(pin(source['path']) != source for source in candidates + cmd['inputs']):
         raise ValueError('Candidate/input changed during validation; logs saved, result not accepted')

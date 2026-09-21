@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import project_support as p
 import server as s
+import platform_support as platform
+from test_platform_support import assert_private, directory_link, unlink_directory
 import state_store as state
 import workflow_support as w
 from test_server import response
@@ -18,7 +20,7 @@ class WorkflowTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.addCleanup(patch.stopall)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.runs = self.root / 'runs'
         patch.object(s, 'RUNS_DIR', self.runs).start()
         self.api = patch.object(s, 'call_responses', side_effect=AssertionError('No live model')).start()
@@ -105,7 +107,7 @@ class WorkflowTests(unittest.TestCase):
         self.api.side_effect = fake
         first = self.start(output_budget=1000)
         checkpoint = first['structuredContent']['followup_checkpoint']
-        self.assertEqual(Path(checkpoint['path']).stat().st_mode & 0o777, 0o600)
+        assert_private(self, checkpoint['path'])
         follow = self.feedback()
         self.assertFalse(follow['isError'], follow)
         self.assertEqual(len(captured), 2)
@@ -157,13 +159,13 @@ class WorkflowTests(unittest.TestCase):
     def test_followup_rejects_changed_project_and_symlink_scope(self):
         allowed = self.root/'allowed'; allowed.mkdir()
         outside = self.root/'outside'; outside.mkdir()
-        link = self.root/'link'; link.symlink_to(allowed, target_is_directory=True)
+        link = self.root/'link'; directory_link(link, allowed)
         contract = self.root/'contract.json'
         contract.write_text(json.dumps({'schema': 'DEEPSEEK_TASK_V2', 'objective': 'bounded',
             'acceptance': ['review'], 'read_paths': ['link/'], 'write_paths': [], 'commands': []}))
         self.api.side_effect = [response('ready')]
         self.start(contract_path=str(contract))
-        link.unlink(); link.symlink_to(outside, target_is_directory=True)
+        unlink_directory(link); directory_link(link, outside)
         self.assertTrue(self.feedback()['isError'])
         self.assertEqual(self.api.call_count, 1)
 
@@ -258,7 +260,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(captured), 8)
         archive = receipt['context_pruning'][0]['archive']
         self.assertEqual(p.pin(archive['path']), archive)
-        self.assertEqual(Path(archive['path']).stat().st_mode & 0o777, 0o600)
+        assert_private(self, archive['path'])
         self.assertIn('full_result', json.dumps(captured[-1]['input']))
 
 

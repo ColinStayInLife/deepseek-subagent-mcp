@@ -80,6 +80,15 @@ class AsyncTests(unittest.TestCase):
                 try: proc.wait(timeout=2)
                 except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=2)
             else: proc.wait()
+        # Detached workers may publish a terminal receipt just before closing
+        # their log/lock handles. Windows cannot unlink those open files yet.
+        for job in a.jobs(self.runs):
+            if a.alive(job) and job['status'] in a.ACTIVE:
+                a.cancel(self.runs, {'task_id': job['task_id']})
+        deadline = time.monotonic() + 3
+        while any(a.alive(job) for job in a.jobs(self.runs)) and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertFalse(any(a.alive(job) for job in a.jobs(self.runs)), 'Fixture workers must exit before cleanup')
         self.temp.cleanup()
 
     def write(self, name, value):
